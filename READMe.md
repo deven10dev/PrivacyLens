@@ -15,44 +15,45 @@ Process multiple videos in batch mode
 
 ### Installation
 1. Clone this repository or download the source code:
-
-git clone <repository-url>
-cd <repository-directory>
+```bash
+git clone https://github.com/deven10dev/PrivacyLens.git
+cd PrivacyLens
+```
 
 2. Create a virtual environment (optional but recommended):
+```bash
 python -m venv venv
+```
 
 3. Activate the virtual environment:
+    - Windows:
+    `venv\Scripts\activate`
 
-- Windows:
-venv\Scripts\activate
-
-- macOS/Linux:
-source venv/bin/activate
+    - macOS/Linux:
+    `source venv/bin/activate`
 
 4. Install required dependencies:
+```bash
 pip install pyqt6 opencv-python deface numpy
+```
 
 ## Usage
 Run the application:
-python desktop_application.py
+`python desktop_application.py`
 
 ### Available Tools
 1. Video Face Anonymization:
-
-- Select one or multiple videos
-- Choose an output folder
-- Configure anonymization settings
-- Process videos in batch mode
+    - Select one or multiple videos
+    - Choose an output folder
+    - Configure anonymization settings
+    - Process videos in batch mode
 
 2. Image Face Anonymization:
-
-- Process multiple images at once
-- Configure similar anonymization settings as video mode
+    - Process multiple images at once
+    - Configure similar anonymization settings as video mode
 
 3. Extract Frames from Videos:
-
-- Extract frames from video files at specified intervals
+    - Extract frames from video files at specified intervals
 
 ## Anonymization Options
 - Methods: Blur, Solid boxes, Mosaic
@@ -63,13 +64,13 @@ python desktop_application.py
 - Draw Scores: Show detection confidence scores
 
 ## Troubleshooting
-- Deface Not Found: Install the deface library using pip install deface
+- Deface Not Found: Install the deface library using `pip install deface`
 - Video Processing Issues: Try using a different video format like .avi or .mkv
-- Corrupt MP4 Files: Re-encode with ffmpeg: ffmpeg -i input.mp4 -c copy fixed.mp4
-- Detection Model Issues: Try reinstalling deface: pip uninstall deface && pip install deface
+- Corrupt MP4 Files: Re-encode with ffmpeg: `ffmpeg -i input.mp4 -c copy fixed.mp4`
+- Detection Model Issues: Try reinstalling deface: `pip uninstall deface && pip install deface`
 
 ## License
-This project is open-source and available under the [LICENSE] terms.
+This project is open-source and available under the [MIT LICENSE](LICENSE) terms.
 
 ## Credits
 This application uses the deface library for face detection and anonymization.

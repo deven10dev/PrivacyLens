@@ -1,6 +1,5 @@
-# Core dependencies
 pyqt6>=6.0.0
 opencv-python>=4.5.0
 numpy>=1.20.0
 deface
-pyinstaller==5.13.0  
+pyinstaller==5.13.0
