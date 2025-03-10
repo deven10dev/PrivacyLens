@@ -22,19 +22,19 @@ cd PrivacyLens
 
 2. Create a virtual environment (optional but recommended):
 ```bash
-python -m venv venv
+python -m venv privacy_lens
 ```
 
 3. Activate the virtual environment:
     - Windows:
-    `venv\Scripts\activate`
+    `privacy_lens\Scripts\activate`
 
     - macOS/Linux:
-    `source venv/bin/activate`
+    `source privacy_lens/bin/activate`
 
 4. Install required dependencies:
 ```bash
-pip install pyqt6 opencv-python deface numpy
+pip install -r requirements.txt
 ```
 
 ## Usage
