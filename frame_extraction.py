@@ -3,6 +3,7 @@ import os
 import subprocess
 import time
 import datetime
+import re    
 import cv2
 import numpy as np
 from pathlib import Path
@@ -255,7 +256,7 @@ class FrameExtractionApp(QMainWindow):
         self.time_interval = QDoubleSpinBox()
         self.time_interval.setMinimum(0.01)
         self.time_interval.setMaximum(60)
-        self.time_interval.setValue(0.1)
+        self.time_interval.setValue(0.2)
         self.time_interval.setSingleStep(0.1)
         self.time_interval.setDecimals(2)
         interval_layout.addWidget(self.time_interval)
@@ -587,9 +588,6 @@ class FrameExtractionApp(QMainWindow):
 
 
 if __name__ == "__main__":
-    # Make sure to import the regex module
-    import re
-    
     app = QApplication(sys.argv)
     window = FrameExtractionApp()
     window.show()

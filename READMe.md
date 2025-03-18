@@ -32,7 +32,13 @@ python -m venv privacy_lens
     - macOS/Linux:
     `source privacy_lens/bin/activate`
 
-4. Install required dependencies:
+4. For Linux machines, make sure to install
+```bash
+sudo apt-get install ubuntu-restricted-extras    # Ubuntu/Debian
+sudo dnf install ffmpeg                          # Fedora/RHEL
+```
+
+5. Install required dependencies:
 ```bash
 pip install -r requirements.txt
 ```

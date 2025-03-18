@@ -1283,6 +1283,20 @@ class VideoAnonymizationApp(QMainWindow):
         
         QMessageBox.information(self, "About deface", about_text)
 
+    def check_dependencies(self):
+        """Check if required dependencies are installed"""
+        try:
+            # Check deface
+            subprocess.run(["deface", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        except (subprocess.SubprocessError, FileNotFoundError):
+            QMessageBox.critical(
+                self,
+                "Deface Not Found",
+                "The deface library was not found. Please install it using:\n\npip install deface"
+            )
+            return False
+        return True
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
