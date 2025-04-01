@@ -176,6 +176,16 @@ class BatchProcessingThread(QThread):
         """Stop the processing"""
         self.is_running = False
 
+    def stop_safely(self):
+        """Safely stop processing and clean up resources"""
+        self.is_running = False
+        
+        # Give processes time to terminate gracefully
+        start_time = time.time()
+        while self.isRunning() and time.time() - start_time < 2:
+            time.sleep(0.1)
+
+
 class FaceAnonymizationBatchApp(QMainWindow):
     """Main application window for batch processing images using deface library"""
     def __init__(self):
@@ -466,41 +476,6 @@ class FaceAnonymizationBatchApp(QMainWindow):
             self.log_text.verticalScrollBar().maximum()
         )
 
-    # def browse_input_folders(self):
-    #     """Open file dialog to select multiple input folders"""
-    #     folder_path = QFileDialog.getExistingDirectory(
-    #         self, "Select Input Folder", ""
-    #     )
-        
-    #     if folder_path:
-    #         # Add the folder to our list if it's not already there
-    #         if folder_path not in self.input_folders:
-    #             self.input_folders.append(folder_path)
-                
-    #             # Update the displayed folder names
-    #             folder_names = ", ".join(
-    #                 [os.path.basename(path) for path in self.input_folders]
-    #             )
-    #             self.input_path_label.setText(folder_names)
-                
-    #             # Set default output folder if this is the first folder
-    #             if len(self.input_folders) == 1:
-    #                 default_output_folder = os.path.join(
-    #                     os.path.dirname(self.input_folders[0]),
-    #                     f"{os.path.basename(self.input_folders[0])}_anonymized"
-    #                 )
-    #                 self.output_folder = default_output_folder
-    #                 self.output_path_label.setText(os.path.basename(default_output_folder) if os.path.basename(default_output_folder) else default_output_folder)
-                
-    #             self.append_log(f"Added input folder: {folder_path}")
-                
-    #             # Load image files from all selected folders
-    #             self.load_files_from_folders(self.input_folders)
-                
-    #             self.check_folders_selected()
-    
-    #     # Add this method to the FaceAnonymizationBatchApp class
-    
     def browse_input_folders(self):
         """Open file dialog to select multiple input folders"""
         folder_path = QFileDialog.getExistingDirectory(
@@ -535,28 +510,6 @@ class FaceAnonymizationBatchApp(QMainWindow):
         self.current_file_label.setText("No file selected")
         self.append_log("Input folders cleared")
         self.check_folders_selected()
-
-    # def browse_output_folder(self):
-    #     """Open file dialog to select output folder location"""
-    #     folder_path = QFileDialog.getExistingDirectory(
-    #         self, "Select Output Folder", ""
-    #     )
-    #     if folder_path:
-    #         self.output_folder = folder_path
-    #         self.output_path_label.setText(os.path.basename(folder_path) if os.path.basename(folder_path) else folder_path)
-    #         self.append_log(f"Output folder set to: {folder_path}")
-    #         self.check_folders_selected()
-
-    # def browse_output_folder(self):
-    #     """Open file dialog to select output folder location"""
-    #     folder_path = QFileDialog.getExistingDirectory(
-    #         self, "Select Output Folder", ""
-    #     )
-    #     if folder_path:
-    #         self.output_folder = folder_path
-    #         self.output_path_label.setText(os.path.basename(folder_path) if os.path.basename(folder_path) else folder_path)
-    #         self.append_log(f"Custom output folder set to: {folder_path}")
-    #         self.check_folders_selected()
 
     def browse_output_folder(self):
         """Open file dialog to select output folder location"""
@@ -785,6 +738,81 @@ class FaceAnonymizationBatchApp(QMainWindow):
         )
         
         QMessageBox.information(self, "About deface", about_text)
+    
+    def closeEvent(self, event):
+        """Handle window close event - stop any running processes"""
+        if hasattr(self, 'processing_thread') and self.processing_thread and self.processing_thread.isRunning():
+            # 1. Add confirmation dialog before attempting to stop
+            reply = QMessageBox.question(
+                self, "Confirm Exit",
+                "Image processing is still running. Do you want to stop processing and close the window?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
+            )
+            
+            # 4. Give user option to cancel window close
+            if reply == QMessageBox.StandardButton.No or reply == QMessageBox.StandardButton.Cancel:
+                self.append_log("Window close canceled by user")
+                event.ignore()
+                return
+            
+            try:
+                self.append_log("Window closing - stopping all image processing...")
+                
+                # 2. Properly disconnect signals with better exception handling
+                signals_to_disconnect = [
+                    (self.processing_thread.progress_updated, self.update_progress),
+                    (self.processing_thread.image_processed, self.update_preview),
+                    (self.processing_thread.processing_finished, self.processing_finished),
+                    (self.processing_thread.log_message, self.append_log),
+                    (self.processing_thread.current_file_changed, self.update_current_file)
+                ]
+                
+                for signal, slot in signals_to_disconnect:
+                    try:
+                        signal.disconnect(slot)
+                    except (TypeError, RuntimeError) as e:
+                        # Handle case where signal was not connected
+                        self.append_log(f"Note: Signal disconnect issue: {str(e)}")
+                
+                # Stop the thread safely
+                self.processing_thread.stop_safely()  # Use stop_safely instead of stop
+                self.processing_thread.wait(1500)  # Wait a bit longer
+                
+                # If still running after graceful attempt, confirm force quit
+                if self.processing_thread.isRunning():
+                    force_reply = QMessageBox.question(
+                        self, "Processing Not Responding",
+                        "Image processing is still running and not responding. Force quit?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    
+                    if force_reply == QMessageBox.StandardButton.Yes:
+                        self.append_log("Forcing thread termination")
+                        self.processing_thread.terminate()
+                        # Wait a brief moment for cleanup
+                        self.processing_thread.wait(300)
+                    else:
+                        self.append_log("Force quit canceled - window will remain open")
+                        event.ignore()
+                        return
+            # 3. Better exception handling
+            except Exception as e:
+                error_message = f"Error during thread cleanup: {str(e)}"
+                self.append_log(f"ERROR: {error_message}")
+                
+                # Show error to user
+                QMessageBox.warning(
+                    self,
+                    "Error During Shutdown",
+                    f"An error occurred while trying to shut down:\n\n{error_message}\n\nThe application will close."
+                )
+        
+        # Log final closure
+        if hasattr(self, 'append_log'):  # Check if method exists before window is fully initialized
+            self.append_log("Application closing")
+            
+        # Accept the close event
+        event.accept()
 
 
 if __name__ == "__main__":

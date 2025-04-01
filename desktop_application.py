@@ -144,9 +144,17 @@ class VideoProcessingThread(QThread):
                 preview_timer = QTimer()
                 last_modified = 0
                 last_position = 0
+                last_heartbeat = time.time()
                 
                 def update_preview():
-                    nonlocal last_modified, last_position, frame_count
+                    nonlocal last_modified, last_position, frame_count, last_heartbeat
+                    
+                    # Add heartbeat to show activity
+                    current_time = time.time()
+                    if current_time - last_heartbeat > 5:  # Every 5 seconds
+                        last_heartbeat = current_time
+                        self.log_message.emit(f"Still processing... (frame count: {frame_count})")
+                        self.frame_processed.emit(QImage(), frame_count, total_frames)
                     
                     # Check if the file has been modified
                     try:
@@ -162,32 +170,31 @@ class VideoProcessingThread(QThread):
                                 # Get current frame count
                                 current_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                                 
-                                                                    # If we have more frames, update progress
+                                # Always update frame count even if we can't get a new image
                                 if current_frames > frame_count:
                                     frame_count = current_frames
                                     if total_frames > 0:
                                         progress = min(int((frame_count / total_frames) * 100), 99)
                                         self.progress_updated.emit(progress)
                                         
-                                        # Emit frame count information
-                                        self.log_message.emit(f"Processing frame: {frame_count}/{total_frames}")
-                                    else:
-                                        # If total frames is unknown, just show current frame
-                                        self.log_message.emit(f"Processing frame: {frame_count}")
+                                    # Send frame counter update REGARDLESS of whether we get a frame
+                                    self.frame_processed.emit(QImage(), frame_count, total_frames)
                                     
-                                    # Seek to the last frame to show the latest progress
-                                    cap.set(cv2.CAP_PROP_POS_FRAMES, current_frames - 1)
-                                    
-                                    ret, frame = cap.read()
-                                    if ret:
-                                        # Convert the frame for Qt display
-                                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                        h, w, ch = rgb_frame.shape
-                                        bytes_per_line = ch * w
-                                        qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-                                        
-                                        # Emit the frame for display
-                                        self.frame_processed.emit(qt_image, frame_count, total_frames)
+                                    # Try to get the latest frame for preview (this might fail)
+                                    try:
+                                        cap.set(cv2.CAP_PROP_POS_FRAMES, current_frames - 1)
+                                        ret, frame = cap.read()
+                                        if ret:
+                                            # Convert and emit with image
+                                            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                            h, w, ch = rgb_frame.shape
+                                            bytes_per_line = ch * w
+                                            qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                                            
+                                            # Emit the frame for display
+                                            self.frame_processed.emit(qt_image, frame_count, total_frames)
+                                    except:
+                                        pass  # Still sent counter update even if image fails
                                 
                                 cap.release()
                     except Exception as e:
@@ -344,23 +351,6 @@ class WelcomeScreen(QWidget):
         buttons_layout.addLayout(button_container_layout2)
         buttons_layout.addLayout(button_container_layout3)
 
-        # Center the buttons
-        # buttons_layout = QVBoxLayout()
-        # buttons_layout.setSpacing(20)
-        
-        # button_container_layout1 = QHBoxLayout()
-        # button_container_layout1.addStretch()
-        # button_container_layout1.addWidget(self.start_button)
-        # button_container_layout1.addStretch()
-        
-        # button_container_layout2 = QHBoxLayout()
-        # button_container_layout2.addStretch()
-        # button_container_layout2.addWidget(self.extract_frames_button)
-        # button_container_layout2.addStretch()
-        
-        # buttons_layout.addLayout(button_container_layout1)
-        # buttons_layout.addLayout(button_container_layout2)
-        
         layout.addLayout(buttons_layout)
         
         # Version info at bottom
@@ -643,12 +633,6 @@ class VideoAnonymizationApp(QMainWindow):
         self.batch_process_btn.setEnabled(False)
         buttons_layout.addWidget(self.batch_process_btn)
 
-        # Add a button to return to welcome screen
-        # self.welcome_btn = QPushButton("Return to Welcome")
-        # self.welcome_btn.clicked.connect(self.return_to_welcome)
-        # self.welcome_btn.setEnabled(True)
-        # buttons_layout.addWidget(self.welcome_btn)
-
         self.about_btn = QPushButton("About deface")
         self.about_btn.clicked.connect(self.show_about)
         
@@ -716,18 +700,6 @@ class VideoAnonymizationApp(QMainWindow):
             
         self.append_log("Opened Frame Extraction Tool")
 
-    # def show_main_screen(self):
-    #     """Switch from welcome screen to main app screen"""
-    #     self.stacked_widget.setCurrentIndex(1)
-    #     # Log application startup after welcome screen
-    #     self.append_log(f"Video Face Anonymization App started (powered by deface {self.deface_version})")
-    #     self.append_log("Ready to process videos")
-        
-    # def return_to_welcome(self):
-    #     """Return to the welcome screen from the main application"""
-    #     self.stacked_widget.setCurrentIndex(0)
-    #     self.append_log("Returned to welcome screen")
-        
     def browse_multiple_files(self):
         """Open file dialog to select multiple input video files"""
         file_paths, _ = QFileDialog.getOpenFileNames(
@@ -828,7 +800,6 @@ class VideoAnonymizationApp(QMainWindow):
         self.current_batch_index = 0
         self.is_processing = True
         self.batch_process_btn.setText("Stop Batch Processing")
-        # self.process_btn.setEnabled(False)
         
         # Disable UI elements during batch processing
         self.disable_ui_during_processing(True)
@@ -938,7 +909,6 @@ class VideoAnonymizationApp(QMainWindow):
         """Handle completion of batch processing"""
         self.is_processing = False
         self.batch_process_btn.setText("Process All Videos")
-        # self.process_btn.setEnabled(True)
         self.force_stop_btn.setEnabled(False)
         
         # Re-enable UI
@@ -966,7 +936,6 @@ class VideoAnonymizationApp(QMainWindow):
     def processing_finished(self, message):
         """Handle the end of processing for single video mode"""
         self.is_processing = False
-        # self.process_btn.setText("Process Video")
         self.status_label.setText(message)
         
         # Disable force stop button
@@ -983,7 +952,6 @@ class VideoAnonymizationApp(QMainWindow):
                 f"{message}\n\nOutput file: {self.output_file}"
             )
 
-    # Make sure to modify the original stop_processing method to handle batch mode
     def stop_processing(self):
         """Stop the video processing"""
         if self.processing_thread and self.processing_thread.isRunning():
@@ -996,10 +964,8 @@ class VideoAnonymizationApp(QMainWindow):
             self.append_log("Batch processing stopped by user")
             self.batch_processing_complete()
 
-    # Update the disable_ui method to also disable batch controls
     def disable_ui_during_processing(self, disable):
         """Enable/disable UI elements during processing"""
-        # self.browse_input_btn.setEnabled(not disable)
         self.browse_output_btn.setEnabled(not disable)
         self.browse_multiple_btn.setEnabled(not disable)
         self.anon_method.setEnabled(not disable)
@@ -1009,7 +975,6 @@ class VideoAnonymizationApp(QMainWindow):
         self.scale_combo.setEnabled(not disable)
         self.box_check.setEnabled(not disable)
         self.draw_scores_check.setEnabled(not disable)
-        # self.welcome_btn.setEnabled(not disable)
 
         # Disable batch control buttons as well
         self.remove_selected_btn.setEnabled(not disable)
@@ -1296,6 +1261,22 @@ class VideoAnonymizationApp(QMainWindow):
             )
             return False
         return True
+
+    def closeEvent(self, event):
+        """Handle window close event - stop any running processes"""
+        if self.is_processing and self.processing_thread and self.processing_thread.isRunning():
+            self.append_log("Window closing - stopping all processing...")
+            self.processing_thread.stop()
+            self.processing_thread.wait(1000)  # Wait up to 1 second for graceful termination
+            
+            # Force termination if still running
+            if self.processing_thread.isRunning():
+                self.processing_thread.terminate()
+            
+            self.is_processing = False
+        
+        # Accept the close event
+        event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

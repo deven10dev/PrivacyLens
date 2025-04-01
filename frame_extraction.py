@@ -16,6 +16,34 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QColor
 
 
+def detect_video_orientation(video_path):
+    """Detect if a video needs rotation based on metadata"""
+    try:
+        # Use ffprobe to get video rotation metadata
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", 
+             "-show_entries", "stream_tags=rotate", "-of", "default=noprint_wrappers=1:nokey=1", 
+             video_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            rotation = int(result.stdout.strip())
+            if rotation == 180:
+                return cv2.ROTATE_180
+            elif rotation == 90:
+                return cv2.ROTATE_90_CLOCKWISE
+            elif rotation == 270:
+                return cv2.ROTATE_90_COUNTERCLOCKWISE
+    except:
+        pass
+        
+    return None
+
+
 class VideoProcessingThread(QThread):
     """Thread for extracting frames from videos without freezing the UI"""
     progress_updated = pyqtSignal(int)
@@ -50,12 +78,9 @@ class VideoProcessingThread(QThread):
                 self.current_file_changed.emit(video_filename)
                 self.log_message.emit(f"Processing video {i+1}/{total_files}: {video_filename}")
                 
-                # Extract timestamp from filename
-                timestamp_str = self.extract_timestamp_from_filename(video_filename)
-                
-                if not timestamp_str:
-                    timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    self.log_message.emit(f"No timestamp found in filename, using current time: {timestamp_str}")
+                # Just use current time and wait a second between videos to ensure uniqueness
+                timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                self.log_message.emit(f"Using timestamp: {timestamp_str}")
                 
                 # Create destination folder
                 dest_dir, is_fresh = self.try_create_folders_on_timestamp(
@@ -68,19 +93,42 @@ class VideoProcessingThread(QThread):
                     self.log_message.emit(f"Folder already exists for {video_filename}. Skipping...")
                     continue
                 
-                # Extract frames
-                num_frames = self.video2img(
-                    video_path, 
-                    dest_dir, 
-                    time_intvl=self.options.get("time_interval", 1),
-                    rotate_code=self.options.get("rotation", None)
-                )
+                # Auto-detect rotation if not manually specified
+                if self.options.get("rotation") is None:
+                    auto_rotation = detect_video_orientation(video_path)
+                    if auto_rotation is not None:
+                        self.log_message.emit(f"Auto-detected rotation for {video_filename}")
+                        # Use the detected rotation
+                        num_frames = self.video2img(
+                            video_path, 
+                            dest_dir, 
+                            time_intvl=self.options.get("time_interval", 1),
+                            rotate_code=auto_rotation
+                        )
+                    else:
+                        # No rotation detected, use normal processing
+                        num_frames = self.video2img(
+                            video_path, 
+                            dest_dir, 
+                            time_intvl=self.options.get("time_interval", 1)
+                        )
+                else:
+                    # Use manually specified rotation
+                    num_frames = self.video2img(
+                        video_path, 
+                        dest_dir, 
+                        time_intvl=self.options.get("time_interval", 1),
+                        rotate_code=self.options.get("rotation")
+                    )
                 
                 self.log_message.emit(f"Extracted {num_frames} frames from {video_filename}")
                 
                 # Update progress
                 progress = int((i + 1) / total_files * 100)
                 self.progress_updated.emit(progress)
+                
+                # Add a small delay before processing the next video to ensure unique timestamp
+                time.sleep(1)
             
             self.log_message.emit(f"Frame extraction completed. Processed {total_files} videos.")
             self.processing_finished.emit(f"Completed processing {total_files} videos")
@@ -386,6 +434,10 @@ class FrameExtractionApp(QMainWindow):
             
             self.append_log(f"Added {len(file_paths)} video files to the list")
             
+            # Reset progress bar when adding new files after completion
+            if not self.is_processing:
+                self.progress_bar.setValue(0)
+            
             # Select first file if none selected
             if self.file_list.currentRow() == -1 and self.file_list.count() > 0:
                 self.file_list.setCurrentRow(0)
@@ -398,6 +450,7 @@ class FrameExtractionApp(QMainWindow):
         self.video_files = []
         self.preview_label.setText("Video preview will appear here")
         self.current_file_label.setText("No file selected")
+        self.progress_bar.setValue(0)
         self.check_files_selected()
         self.append_log("Cleared video list")
     
@@ -567,6 +620,11 @@ class FrameExtractionApp(QMainWindow):
         # Re-enable UI elements
         self.disable_ui_during_processing(False)
         
+        # Reset progress when finished but don't immediately show 0%
+        # Only reset to 0% if the operation was explicitly stopped
+        if "stopped" in message.lower():
+            self.progress_bar.setValue(0)
+        
         # Show a message box if completed successfully
         if "Completed" in message:
             QMessageBox.information(
@@ -585,6 +643,41 @@ class FrameExtractionApp(QMainWindow):
         self.rotation_combo.setEnabled(not disable)
         self.overwrite_check.setEnabled(not disable)
         self.file_list.setEnabled(not disable)
+    
+    def closeEvent(self, event):
+        """Handle window close event - stop any running processes"""
+        if hasattr(self, 'processing_thread') and self.processing_thread and self.processing_thread.isRunning():
+            reply = QMessageBox.question(
+                self, "Processing in Progress",
+                "Processing is still running. Stop processing and exit?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                self.append_log("Window closing - stopping extraction...")
+                
+                # First disconnect all signals to prevent callbacks to destroyed objects
+                try:
+                    self.processing_thread.progress_updated.disconnect()
+                    self.processing_thread.frame_extracted.disconnect()
+                    self.processing_thread.processing_finished.disconnect()
+                    self.processing_thread.log_message.disconnect()
+                    self.processing_thread.current_file_changed.disconnect()
+                except Exception:
+                    pass  # In case signals weren't connected
+                
+                # Set the stop flag and wait
+                self.processing_thread.is_running = False
+                self.processing_thread.wait(1000)  # Wait up to 1 second
+                
+                # Force termination if still running
+                if self.processing_thread.isRunning():
+                    self.processing_thread.terminate()
+            else:
+                event.ignore()
+                return
+        
+        event.accept()
 
 
 if __name__ == "__main__":

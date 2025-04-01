@@ -7,8 +7,9 @@ import time
 import datetime
 import cv2
 import numpy as np
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton, 
-                            QVBoxLayout, QHBoxLayout, QFileDialog, QSlider, QWidget,
                             QProgressBar, QComboBox, QSpinBox, QCheckBox, QGroupBox,
                             QRadioButton, QButtonGroup, QMessageBox, QPlainTextEdit,
                             QListWidget, QListWidgetItem, QStackedWidget)
@@ -31,6 +32,21 @@ class VideoProcessingThread(QThread):
     
     def run(self):
         try:
+            # Check file size before processing
+            file_size_mb = os.path.getsize(self.input_file) / (1024 * 1024)
+            if file_size_mb > 500:  # 500MB threshold
+                message = f"Large file detected ({file_size_mb:.1f} MB). Processing may take a long time."
+                self.log_message.emit(message)
+                if file_size_mb > 2000:  # 2GB threshold
+                    answer = QMessageBox.question(
+                        None, 
+                        "Very Large File", 
+                        f"The file is extremely large ({file_size_mb:.1f} MB). Processing may take a very long time and use significant system resources. Continue?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    if answer == QMessageBox.StandardButton.No:
+                        return
+
             # Create output folder if it doesn't exist
             output_dir = os.path.dirname(self.output_file)
             if output_dir:
@@ -70,31 +86,77 @@ class VideoProcessingThread(QThread):
             
             # Open video to get total frames (for progress calculation)
             try:
-                cap = cv2.VideoCapture(self.input_file)
-                if not cap.isOpened():
-                    self.log_message.emit("Warning: Could not open input video file.")
-                    total_frames = 0
-                else:
-                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    # Some video formats don't report frame count correctly
-                    if total_frames <= 0:
-                        self.log_message.emit("Warning: Could not determine total frames from metadata.")
-                        # Try to estimate by seeking to the end
-                        cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1)
-                        total_frames = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                        cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 0)  # Reset to beginning
+                # Use ffprobe to get frame count (more reliable than OpenCV)
+                try:
+                    result = subprocess.run(
+                        ["ffprobe", "-v", "error", "-select_streams", "v:0", 
+                         "-show_entries", "stream=nb_frames", "-of", "default=noprint_wrappers=1:nokey=1", 
+                         self.input_file],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        timeout=10
+                    )
                     
-                    if total_frames > 0:
-                        self.log_message.emit(f"Total frames in video: {total_frames}")
+                    if result.returncode == 0 and result.stdout.strip().isdigit():
+                        total_frames = int(result.stdout.strip())
+                        self.log_message.emit(f"Total frames (from ffprobe): {total_frames}")
                     else:
-                        self.log_message.emit("Warning: Unable to determine total frames. Progress will be estimated.")
+                        # Fall back to OpenCV method...
+                        cap = cv2.VideoCapture(self.input_file)
+                        if not cap.isOpened():
+                            self.log_message.emit("Warning: Could not open input video file.")
+                            total_frames = 0
+                        else:
+                            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                            # Some video formats don't report frame count correctly
+                            if total_frames <= 0:
+                                self.log_message.emit("Warning: Could not determine total frames from metadata.")
+                                # Try to estimate by seeking to the end
+                                # This seeking operation can be problematic for large videos
+                                cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1)
+                                total_frames = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                                cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 0)  # Reset to beginning
+                            
+                            if total_frames > 0:
+                                self.log_message.emit(f"Total frames in video: {total_frames}")
+                            else:
+                                self.log_message.emit("Warning: Unable to determine total frames. Progress will be estimated.")
+                                total_frames = 0
+                            
+                        cap.release()
+                except:
+                    # Fall back to OpenCV method...
+                    cap = cv2.VideoCapture(self.input_file)
+                    if not cap.isOpened():
+                        self.log_message.emit("Warning: Could not open input video file.")
                         total_frames = 0
-                    
-                cap.release()
+                    else:
+                        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        # Some video formats don't report frame count correctly
+                        if total_frames <= 0:
+                            self.log_message.emit("Warning: Could not determine total frames from metadata.")
+                            # Try to estimate by seeking to the end
+                            # This seeking operation can be problematic for large videos
+                            cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1)
+                            total_frames = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                            cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 0)  # Reset to beginning
+                        
+                        if total_frames > 0:
+                            self.log_message.emit(f"Total frames in video: {total_frames}")
+                        else:
+                            self.log_message.emit("Warning: Unable to determine total frames. Progress will be estimated.")
+                            total_frames = 0
+                        
+                    cap.release()
             except Exception as e:
                 self.log_message.emit(f"Warning: Could not determine total frames. Progress may be inaccurate. Error: {str(e)}")
                 total_frames = 0
             
+            # Initialize before the while loop that reads stderr
+            frame_count = 0
+            last_heartbeat = time.time()
+
             # Execute deface with a pipe to capture realtime output
             process = subprocess.Popen(
                 cmd,
@@ -102,114 +164,44 @@ class VideoProcessingThread(QThread):
                 stderr=subprocess.PIPE,
                 universal_newlines=True,
                 bufsize=1,
-                # creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+                creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
             )
             
-            # Set up a timer to read the output video and send frame updates
-            # This allows us to show progress and preview while deface is running
-            preview_cap = None
-            frame_count = 0
-            
-            # Define a function to check if the output file exists and is readable
-            def check_output_file():
-                if os.path.exists(self.output_file):
-                    try:
-                        cap = cv2.VideoCapture(self.output_file)
-                        if cap.isOpened():
-                            ret, frame = cap.read()
-                            cap.release()
-                            return ret
-                    except:
-                        pass
-                return False
-            
-            # Wait for the output file to be created (with timeout)
-            start_time = time.time()
-            file_ready = False
-            
-            while not file_ready and time.time() - start_time < 30:  # 30 seconds timeout
-                file_ready = check_output_file()
-                if not file_ready:
-                    time.sleep(0.5)  # Check every half second
-                    self.log_message.emit("Waiting for output file to be created...")
-            
-            if file_ready:
-                self.log_message.emit("Output file created. Starting preview...")
+            # Add a debug message
+            self.log_message.emit("Starting to read output from deface process...")
+
+            # Read process output to track progress
+            while self.is_running and process.poll() is None:
+                # Try to read a line from stderr (deface outputs progress there)
+                stderr_line = process.stderr.readline().strip()
                 
-                # Set up a timer to periodically check the output file and update the preview
-                preview_timer = QTimer()
-                last_modified = 0
-                last_position = 0
+                # Heartbeat to show the process is still alive
+                current_time = time.time()
+                if current_time - last_heartbeat > 10:  # Send heartbeat every 10 seconds
+                    last_heartbeat = current_time
+                    self.log_message.emit(f"Still processing... (current frame: {frame_count})")
+                    # Force a UI update with current frame count
+                    self.frame_processed.emit(QImage(), frame_count, total_frames)
                 
-                def update_preview():
-                    nonlocal last_modified, last_position, frame_count
-                    
-                    # Check if the file has been modified
-                    try:
-                        current_modified = os.path.getmtime(self.output_file)
-                        
-                        if current_modified > last_modified:
-                            last_modified = current_modified
-                            
-                            # Try to open the video and read the latest frame
-                            cap = cv2.VideoCapture(self.output_file)
-                            
-                            if cap.isOpened():
-                                # Get current frame count
-                                current_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                                
-                                                                    # If we have more frames, update progress
-                                if current_frames > frame_count:
-                                    frame_count = current_frames
-                                    if total_frames > 0:
-                                        progress = min(int((frame_count / total_frames) * 100), 99)
-                                        self.progress_updated.emit(progress)
-                                        
-                                        # Emit frame count information
-                                        self.log_message.emit(f"Processing frame: {frame_count}/{total_frames}")
-                                    else:
-                                        # If total frames is unknown, just show current frame
-                                        self.log_message.emit(f"Processing frame: {frame_count}")
+                if stderr_line:
+                    # Log raw output for debugging
+                    if "Processing frame" in stderr_line:
+                        # Parse frame number from output
+                        try:
+                            match = re.search(r"Processing frame (\d+)", stderr_line)
+                            if match:
+                                frame_num = int(match.group(1))
+                                if frame_num > frame_count:
+                                    frame_count = frame_num
+                                    # Update UI with the parsed frame count
+                                    self.frame_processed.emit(QImage(), frame_count, total_frames)
                                     
-                                    # Seek to the last frame to show the latest progress
-                                    cap.set(cv2.CAP_PROP_POS_FRAMES, current_frames - 1)
-                                    
-                                    ret, frame = cap.read()
-                                    if ret:
-                                        # Convert the frame for Qt display
-                                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                        h, w, ch = rgb_frame.shape
-                                        bytes_per_line = ch * w
-                                        qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-                                        
-                                        # Emit the frame for display
-                                        self.frame_processed.emit(qt_image, frame_count, total_frames)
-                                
-                                cap.release()
-                    except Exception as e:
-                        self.log_message.emit(f"Preview update error: {str(e)}")
-                
-                # Initialize a counter for logging frame updates
-                # We don't want to flood the log with every frame update
-                log_counter = 0
-                log_interval = 10  # Log every 10th frame
-                
-                # Use a regular timer in the thread to check the output file
-                while self.is_running and process.poll() is None:
-                    update_preview()
-                    
-                    # Increment log counter
-                    log_counter += 1
-                    
-                    # Only log frame progress at intervals to avoid flooding the log
-                    if log_counter % log_interval == 0 and frame_count > 0:
-                        if total_frames > 0:
-                            self.log_message.emit(f"Processing frame: {frame_count}/{total_frames} ({(frame_count/total_frames*100):.1f}%)")
-                        else:
-                            self.log_message.emit(f"Processing frame: {frame_count}")
-                    
-                    time.sleep(0.5)  # Check every half second
-            
+                                    # Log every 100 frames for reassurance
+                                    if frame_count % 100 == 0:
+                                        self.log_message.emit(f"Processing frame {frame_count}...")
+                        except Exception as e:
+                            self.log_message.emit(f"Error parsing frame number: {str(e)}")
+
             # Process is still running, wait for it to complete
             stdout, stderr = process.communicate()
             
@@ -552,11 +544,8 @@ class FaceAnonymizationVideoApp(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(True)
         self.status_label = QLabel("Ready")
-        self.frame_counter_label = QLabel("Frame: 0/0")
-        self.frame_counter_label.setMinimumWidth(150)  # Ensure enough space for frame counts
         progress_layout.addWidget(self.progress_bar)
         progress_layout.addWidget(self.status_label)
-        progress_layout.addWidget(self.frame_counter_label)
         
         # Control buttons
         buttons_layout = QHBoxLayout()
@@ -625,6 +614,10 @@ class FaceAnonymizationVideoApp(QMainWindow):
                 self.add_to_batch(file_path)
             
             self.append_log(f"Added {len(file_paths)} videos to batch processing queue")
+            
+            # Reset progress bar when adding new files
+            self.progress_bar.setValue(0)
+            
             self.update_batch_process_button()
     
     def add_to_batch(self, file_path):
@@ -660,6 +653,7 @@ class FaceAnonymizationVideoApp(QMainWindow):
         if count > 0:
             self.batch_list.clear()
             self.append_log(f"Cleared all {count} videos from batch queue")
+            self.progress_bar.setValue(0)
             self.update_batch_process_button()
     
     def move_item_up(self):
@@ -775,7 +769,6 @@ class FaceAnonymizationVideoApp(QMainWindow):
         
         # Reset progress bar
         self.progress_bar.setValue(0)
-        self.frame_counter_label.setText("Frame: 0/0")
         
         # Create and start the processing thread
         self.processing_thread = VideoProcessingThread(
@@ -824,11 +817,13 @@ class FaceAnonymizationVideoApp(QMainWindow):
         """Handle completion of batch processing"""
         self.is_processing = False
         self.batch_process_btn.setText("Process All Videos")
-        # self.process_btn.setEnabled(True)
         self.force_stop_btn.setEnabled(False)
         
         # Re-enable UI
         self.disable_ui_during_processing(False)
+        
+        # Reset progress bar to 0
+        self.progress_bar.setValue(0)
         
         # Display results
         if self.current_batch_index > 0:
@@ -1181,28 +1176,24 @@ class FaceAnonymizationVideoApp(QMainWindow):
     
     def update_frame_preview(self, image, current_frame=0, total_frames=0):
         """Update the preview with the current processed frame"""
-        pixmap = QPixmap.fromImage(image)
-        
-        # Scale the pixmap to fit the preview label while maintaining aspect ratio
-        scaled_pixmap = pixmap.scaled(
-            self.preview_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        
-        self.preview_label.setPixmap(scaled_pixmap)
-        
-        # Update the frame counter label with frame information
-        if total_frames > 0:
-            self.frame_counter_label.setText(f"Frame: {current_frame}/{total_frames}")
-            # Also update the status text for more visibility
+        # Update status with simplified progress information
+        if total_frames > 0 and current_frame > 0:
             self.status_label.setText(f"Processing: {(current_frame/total_frames*100):.1f}%")
-        elif current_frame > 0:
-            self.frame_counter_label.setText(f"Frame: {current_frame}")
-            self.status_label.setText("Processing...")
         else:
-            self.frame_counter_label.setText("Frame: 0/0")
             self.status_label.setText("Processing...")
+        
+        # Only update the image if we received a valid one
+        if not image.isNull():
+            pixmap = QPixmap.fromImage(image)
+            
+            # Scale the pixmap to fit the preview label while maintaining aspect ratio
+            scaled_pixmap = pixmap.scaled(
+                self.preview_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            
+            self.preview_label.setPixmap(scaled_pixmap)
     
     # def processing_finished(self, message):
     #     """Handle the end of processing"""
@@ -1251,6 +1242,55 @@ class FaceAnonymizationVideoApp(QMainWindow):
         )
         
         QMessageBox.information(self, "About deface", about_text)
+
+    def closeEvent(self, event):
+        """Handle window close event - stop any running processes"""
+        if self.is_processing and hasattr(self, 'processing_thread') and self.processing_thread and self.processing_thread.isRunning():
+            # 1. Add confirmation dialog before attempting to stop
+            reply = QMessageBox.question(
+                self, "Confirm Exit",
+                "Video processing is still running. Do you want to stop processing and close the window?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
+            )
+            
+            if reply == QMessageBox.StandardButton.No or reply == QMessageBox.StandardButton.Cancel:
+                self.append_log("Window close canceled by user")
+                event.ignore()
+                return
+            
+            try:
+                self.append_log("Window closing - stopping video processing...")
+                
+                # Simpler approach to disconnect signals - disconnect all slots
+                try:
+                    if hasattr(self.processing_thread, 'progress_updated'):
+                        self.processing_thread.progress_updated.disconnect()
+                    if hasattr(self.processing_thread, 'frame_processed'):
+                        self.processing_thread.frame_processed.disconnect()
+                    if hasattr(self.processing_thread, 'processing_finished'):
+                        self.processing_thread.processing_finished.disconnect()
+                    if hasattr(self.processing_thread, 'log_message'):
+                        self.processing_thread.log_message.disconnect()
+                except Exception as e:
+                    self.append_log(f"Signal disconnect: {str(e)}")
+                
+                # Stop the thread safely
+                self.processing_thread.is_running = False  # Make sure the flag is set
+                self.processing_thread.stop()
+                self.processing_thread.wait(1500)
+                
+                # Force termination if still running
+                if self.processing_thread.isRunning():
+                    self.processing_thread.terminate()
+                    self.processing_thread.wait(300)
+                    
+            except Exception as e:
+                self.append_log(f"ERROR during shutdown: {str(e)}")
+        
+        # Log final closure and accept event
+        if hasattr(self, 'append_log'):
+            self.append_log("Application closing")
+        event.accept()
 
 
 if __name__ == "__main__":
