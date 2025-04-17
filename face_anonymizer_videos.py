@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton,
                             QListWidget, QListWidgetItem, QStackedWidget)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
 from PyQt6.QtGui import QImage, QPixmap, QColor, QFont, QIcon
+from deface_integration import DefaceIntegration
 
 class VideoProcessingThread(QThread):
     """Thread for processing videos with deface without freezing the UI"""

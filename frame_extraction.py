@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton,
                             QListWidget, QDoubleSpinBox, QLineEdit)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QColor
+from deface_integration import DefaceIntegration
 
 
 def detect_video_orientation(video_path):
@@ -217,6 +218,9 @@ class VideoProcessingThread(QThread):
                 if rotate_code is not None:
                     frame = cv2.rotate(frame, rotate_code)
                 
+                # Process the frame
+                frame = self.process_frame(frame)
+                
                 # Save the frame
                 output_filename = os.path.join(
                     dest_dir, 
@@ -240,6 +244,24 @@ class VideoProcessingThread(QThread):
     def stop(self):
         """Stop the processing"""
         self.is_running = False
+    
+    def process_frame(self, frame):
+        # Get settings from UI or parameters
+        threshold = 0.2  # Set from your UI
+        replacewith = "blur"  # Set from your UI
+        mask_scale = 1.3  # Set from your UI
+        ellipse = True  # Set from your UI
+        
+        # Process the frame
+        processed_frame = self.deface.process_frame(
+            frame=frame,
+            threshold=threshold,
+            replacewith=replacewith,
+            mask_scale=mask_scale,
+            ellipse=ellipse
+        )
+        
+        return processed_frame
 
 
 class FrameExtractionApp(QMainWindow):

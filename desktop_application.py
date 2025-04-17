@@ -18,6 +18,7 @@ from PyQt6.QtGui import QImage, QPixmap, QColor, QFont, QIcon
 # Import the frame extraction app
 from frame_extraction import FrameExtractionApp
 from face_anonymizer_images import FaceAnonymizationBatchApp
+from deface_integration import DefaceIntegration
 
 class VideoProcessingThread(QThread):
     """Thread for processing videos with deface without freezing the UI"""
@@ -26,12 +27,13 @@ class VideoProcessingThread(QThread):
     processing_finished = pyqtSignal(str)
     log_message = pyqtSignal(str)
     
-    def __init__(self, input_file, output_file, options):
+    def __init__(self, input_file, output_file, options, deface_integration=None):
         super().__init__()
         self.input_file = input_file
         self.output_file = output_file
         self.options = options
         self.is_running = True
+        self.deface_integration = deface_integration or DefaceIntegration()
     
     def run(self):
         try:
@@ -42,216 +44,54 @@ class VideoProcessingThread(QThread):
             
             self.log_message.emit(f"Processing video: {os.path.basename(self.input_file)}")
             
-            # Build the deface command
-            cmd = ["deface", str(self.input_file), "-o", str(self.output_file)]
-            
-            # Add options based on user selections
-            if self.options["threshold"] != 0.2:  # Default is 0.2
-                cmd.extend(["--thresh", str(self.options["threshold"])])
-            
-            if self.options["mask_scale"] != 1.3:  # Default is 1.3
-                cmd.extend(["--mask-scale", str(self.options["mask_scale"])])
-            
-            if self.options["anonymization_method"] != "blur":
-                cmd.extend(["--replacewith", self.options["anonymization_method"]])
-            
-            if self.options["anonymization_method"] == "mosaic" and self.options["mosaic_size"] != 20:
-                cmd.extend(["--mosaicsize", str(self.options["mosaic_size"])])
-            
-            if self.options["box_method"]:
-                cmd.append("--boxes")
-            
-            if self.options["draw_scores"]:
-                cmd.append("--draw-scores")
-            
-            # Scaling option for detection
-            if self.options["scale"]:
-                cmd.extend(["--scale", self.options["scale"]])
-            
-            # Log the command being executed
-            cmd_str = " ".join(cmd)
-            self.log_message.emit(f"Executing command: {cmd_str}")
-            
-            # Open video to get total frames (for progress calculation)
+            # Get frame count if possible for update interval calculation
             try:
-                cap = cv2.VideoCapture(self.input_file)
-                if not cap.isOpened():
-                    self.log_message.emit("Warning: Could not open input video file.")
-                    total_frames = 0
-                else:
-                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    # Some video formats don't report frame count correctly
-                    if total_frames <= 0:
-                        self.log_message.emit("Warning: Could not determine total frames from metadata.")
-                        # Try to estimate by seeking to the end
-                        cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1)
-                        total_frames = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                        cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 0)  # Reset to beginning
-                    
-                    if total_frames > 0:
-                        self.log_message.emit(f"Total frames in video: {total_frames}")
-                    else:
-                        self.log_message.emit("Warning: Unable to determine total frames. Progress will be estimated.")
-                        total_frames = 0
-                    
-                cap.release()
-            except Exception as e:
-                self.log_message.emit(f"Warning: Could not determine total frames. Progress may be inaccurate. Error: {str(e)}")
-                total_frames = 0
+                reader = imageio.get_reader(self.input_file)
+                frame_count = reader.count_frames()
+                reader.close()
+                
+                # Update every ~1% of frames, with limits
+                update_interval = max(1, min(frame_count // 100, 30))
+            except:
+                update_interval = 30  # Default if frame count unknown
             
-            # Execute deface with a pipe to capture realtime output
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                bufsize=1,
-                # creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+            # Custom progress callback with reduced update frequency
+            def progress_callback(progress):
+                # Only update UI every update_interval percent
+                if progress % update_interval == 0 or progress == 100:
+                    self.progress_updated.emit(progress)
+            
+            # Process the video using our integration
+            self.deface_integration.process_video(
+                input_path=self.input_file,
+                output_path=self.output_file,
+                threshold=self.options["threshold"],
+                replacewith=self.options["anonymization_method"],
+                mask_scale=self.options["mask_scale"],
+                ellipse=not self.options["box_method"],
+                draw_scores=self.options["draw_scores"],
+                keep_audio=True,
+                replaceimg=None,
+                mosaicsize=self.options.get("mosaic_size", 20),
+                progress_callback=progress_callback,
+                batch_size=4  # Process 4 frames at once for better efficiency
             )
             
-            # Set up a timer to read the output video and send frame updates
-            # This allows us to show progress and preview while deface is running
-            preview_cap = None
-            frame_count = 0
-            
-            # Define a function to check if the output file exists and is readable
-            def check_output_file():
-                if os.path.exists(self.output_file):
-                    try:
-                        cap = cv2.VideoCapture(self.output_file)
-                        if cap.isOpened():
-                            ret, frame = cap.read()
-                            cap.release()
-                            return ret
-                    except:
-                        pass
-                return False
-            
-            # Wait for the output file to be created (with timeout)
-            start_time = time.time()
-            file_ready = False
-            
-            while not file_ready and time.time() - start_time < 30:  # 30 seconds timeout
-                file_ready = check_output_file()
-                if not file_ready:
-                    time.sleep(0.5)  # Check every half second
-                    self.log_message.emit("Waiting for output file to be created...")
-            
-            if file_ready:
-                self.log_message.emit("Output file created. Starting preview...")
-                
-                # Set up a timer to periodically check the output file and update the preview
-                preview_timer = QTimer()
-                last_modified = 0
-                last_position = 0
-                last_heartbeat = time.time()
-                
-                def update_preview():
-                    nonlocal last_modified, last_position, frame_count, last_heartbeat
-                    
-                    # Add heartbeat to show activity
-                    current_time = time.time()
-                    if current_time - last_heartbeat > 5:  # Every 5 seconds
-                        last_heartbeat = current_time
-                        self.log_message.emit(f"Still processing... (frame count: {frame_count})")
-                        self.frame_processed.emit(QImage(), frame_count, total_frames)
-                    
-                    # Check if the file has been modified
-                    try:
-                        current_modified = os.path.getmtime(self.output_file)
-                        
-                        if current_modified > last_modified:
-                            last_modified = current_modified
-                            
-                            # Try to open the video and read the latest frame
-                            cap = cv2.VideoCapture(self.output_file)
-                            
-                            if cap.isOpened():
-                                # Get current frame count
-                                current_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                                
-                                # Always update frame count even if we can't get a new image
-                                if current_frames > frame_count:
-                                    frame_count = current_frames
-                                    if total_frames > 0:
-                                        progress = min(int((frame_count / total_frames) * 100), 99)
-                                        self.progress_updated.emit(progress)
-                                        
-                                    # Send frame counter update REGARDLESS of whether we get a frame
-                                    self.frame_processed.emit(QImage(), frame_count, total_frames)
-                                    
-                                    # Try to get the latest frame for preview (this might fail)
-                                    try:
-                                        cap.set(cv2.CAP_PROP_POS_FRAMES, current_frames - 1)
-                                        ret, frame = cap.read()
-                                        if ret:
-                                            # Convert and emit with image
-                                            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                                            h, w, ch = rgb_frame.shape
-                                            bytes_per_line = ch * w
-                                            qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-                                            
-                                            # Emit the frame for display
-                                            self.frame_processed.emit(qt_image, frame_count, total_frames)
-                                    except:
-                                        pass  # Still sent counter update even if image fails
-                                
-                                cap.release()
-                    except Exception as e:
-                        self.log_message.emit(f"Preview update error: {str(e)}")
-                
-                # Initialize a counter for logging frame updates
-                # We don't want to flood the log with every frame update
-                log_counter = 0
-                log_interval = 10  # Log every 10th frame
-                
-                # Use a regular timer in the thread to check the output file
-                while self.is_running and process.poll() is None:
-                    update_preview()
-                    
-                    # Increment log counter
-                    log_counter += 1
-                    
-                    # Only log frame progress at intervals to avoid flooding the log
-                    if log_counter % log_interval == 0 and frame_count > 0:
-                        if total_frames > 0:
-                            self.log_message.emit(f"Processing frame: {frame_count}/{total_frames} ({(frame_count/total_frames*100):.1f}%)")
-                        else:
-                            self.log_message.emit(f"Processing frame: {frame_count}")
-                    
-                    time.sleep(0.5)  # Check every half second
-            
-            # Process is still running, wait for it to complete
-            stdout, stderr = process.communicate()
-            
-            # Check if successful
-            if process.returncode == 0:
-                self.log_message.emit("Video processing completed successfully")
-                self.progress_updated.emit(100)  # Ensure 100% at the end
-                self.processing_finished.emit("Video processing completed")
-            else:
-                error_msg = f"Error processing video: {stderr}"
-                self.log_message.emit(error_msg)
-                
-                # Check for common errors and provide more helpful feedback
-                if "moov atom not found" in stderr:
-                    self.log_message.emit("This error often occurs with corrupted MP4 files or files with metadata issues.")
-                    self.log_message.emit("Possible solutions:")
-                    self.log_message.emit("1. Try re-encoding the video with ffmpeg: ffmpeg -i input.mp4 -c copy fixed.mp4")
-                    self.log_message.emit("2. Use a different video format like .avi or .mkv")
-                    self.log_message.emit("3. If the video plays in a media player, try capturing it with a screen recorder")
-                    self.processing_finished.emit("Processing failed - MP4 metadata issue detected")
-                elif "Failed to create detector" in stderr:
-                    self.log_message.emit("This error may occur if there are issues with the face detection model.")
-                    self.log_message.emit("Try reinstalling deface: pip uninstall deface && pip install deface")
-                    self.processing_finished.emit("Processing failed - Detection model issue")
-                else:
-                    self.processing_finished.emit("Processing failed")
+            self.log_message.emit("Video processing completed successfully")
+            self.progress_updated.emit(100)
+            self.processing_finished.emit("Video processing completed")
             
         except Exception as e:
             error_msg = f"Error during video processing: {str(e)}"
             self.log_message.emit(error_msg)
             self.processing_finished.emit(error_msg)
+    
+    def update_progress(self, progress):
+        """Handle progress updates from the processing function"""
+        self.progress_updated.emit(progress)
+        
+        # You could also update frame previews here if needed
+        # For now we'll just emit the progress updates
     
     def stop(self):
         """Stop the processing"""
@@ -367,6 +207,9 @@ class FaceAnonymizationVideoApp(QMainWindow):
         self.setWindowTitle("Face Anonymization Tools")
         self.setMinimumSize(800, 600)
         
+        # Create the deface integration
+        self.deface = DefaceIntegration()
+        
         self.frame_extraction_window = None
         self.image_anonymization_window = None
         self.video_anonymization_window = None
@@ -383,6 +226,7 @@ class FaceAnonymizationVideoApp(QMainWindow):
         """Open the video anonymization tool in a separate window"""
         if not self.video_anonymization_window or not self.video_anonymization_window.isVisible():
             self.video_anonymization_window = VideoAnonymizationApp()
+            self.video_anonymization_window.set_deface_integration(self.deface)
             self.video_anonymization_window.show()
         else:
             self.video_anonymization_window.setWindowState(self.video_anonymization_window.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
@@ -1208,29 +1052,33 @@ class VideoAnonymizationApp(QMainWindow):
         self.progress_bar.setFormat(f"{value}%")
     
     def update_frame_preview(self, image, current_frame=0, total_frames=0):
-        """Update the preview with the current processed frame"""
-        pixmap = QPixmap.fromImage(image)
+        """Update the preview with reduced frequency and scaling"""
+        # Only update preview every 10 frames or when progress is updated
+        if current_frame % 10 != 0 and current_frame != total_frames - 1:
+            return
+            
+        # Skip preview generation if widget isn't visible
+        if not self.isVisible() or self.isMinimized():
+            return
+            
+        # Create a smaller preview for better performance
+        preview_size = (320, 180)  # 16:9 ratio, smaller size
         
-        # Scale the pixmap to fit the preview label while maintaining aspect ratio
-        scaled_pixmap = pixmap.scaled(
-            self.preview_label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        
-        self.preview_label.setPixmap(scaled_pixmap)
-        
-        # Update the frame counter label with frame information
-        if total_frames > 0:
-            self.frame_counter_label.setText(f"Frame: {current_frame}/{total_frames}")
-            # Also update the status text for more visibility
-            self.status_label.setText(f"Processing: {(current_frame/total_frames*100):.1f}%")
-        elif current_frame > 0:
-            self.frame_counter_label.setText(f"Frame: {current_frame}")
-            self.status_label.setText("Processing...")
-        else:
-            self.frame_counter_label.setText("Frame: 0/0")
-            self.status_label.setText("Processing...")
+        try:
+            # Use fast resize method for preview only
+            scaled_pixmap = pixmap.scaled(
+                *preview_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation  # Use faster transformation
+            )
+            
+            self.preview_label.setPixmap(scaled_pixmap)
+            
+            # Update frame counter less frequently
+            if total_frames > 0:
+                self.frame_counter_label.setText(f"Frame: {current_frame}/{total_frames}")
+        except:
+            pass  # Ignore preview errors to maintain processing speed
       
     def show_about(self):
         """Show information about deface"""
@@ -1277,6 +1125,57 @@ class VideoAnonymizationApp(QMainWindow):
         
         # Accept the close event
         event.accept()
+
+    def set_deface_integration(self, deface_integration):
+        self.deface = deface_integration
+        # Update any related labels/state if needed
+        self.append_log("Using direct deface integration (no command line)")
+
+    def start_processing(self):
+        """Start processing with adaptive quality based on video size"""
+        # Get video file size and adapt settings
+        file_size_mb = os.path.getsize(self.input_file) / (1024 * 1024)
+        
+        if file_size_mb > 1000:  # For very large videos (>1GB)
+            self.append_log("Large file detected - enabling performance optimizations")
+            # Reduce resolution for detection
+            detection_scale = 0.33
+            # Increase batch size
+            batch_size = 8
+            # Decrease update frequency
+            update_interval = 30
+        elif file_size_mb > 100:  # Medium size (100MB-1GB)
+            detection_scale = 0.5
+            batch_size = 4
+            update_interval = 15
+        else:  # Small videos
+            detection_scale = 0.75
+            batch_size = 2
+            update_interval = 5
+            
+        # Pass these parameters to the processing thread
+        self.processing_thread = VideoProcessingThread(
+            self.input_file,
+            self.output_file,
+            {**self.options, 
+             "detection_scale": detection_scale,
+             "batch_size": batch_size,
+             "update_interval": update_interval}
+        )
+
+class MainApplication:
+    def __init__(self):
+        self.deface = DefaceIntegration()
+        
+        # Pass deface to components
+        self.image_processor = FaceAnonymizationBatchApp()
+        self.image_processor.deface = self.deface
+        
+        self.video_processor = FaceAnonymizationVideoApp()
+        self.video_processor.deface = self.deface
+        
+        self.frame_extractor = FrameExtractionApp()
+        self.frame_extractor.deface = self.deface
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

@@ -16,6 +16,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QColor
 
+from deface_integration import DefaceIntegration
+
 
 class BatchProcessingThread(QThread):
     """Thread for processing multiple images with deface without freezing the UI"""
@@ -813,6 +815,56 @@ class FaceAnonymizationBatchApp(QMainWindow):
             
         # Accept the close event
         event.accept()
+
+
+class FaceAnonymizerImages:
+    def __init__(self):
+        self.deface = DefaceIntegration()
+    
+    def process_image(self, input_path, output_path=None):
+        # Determine output path if not provided
+        if not output_path:
+            root, ext = os.path.splitext(input_path)
+            output_path = f"{root}_anonymized{ext}"
+        
+        # Get settings from UI
+        threshold = self.threshold_slider.value() / 100  # Assuming slider is 0-100
+        replacewith = self.get_selected_method()  # Get from UI dropdown
+        mask_scale = self.mask_scale_slider.value() / 100  # Adjust based on your UI
+        ellipse = self.ellipse_checkbox.isChecked()
+        
+        # Process with deface
+        try:
+            self.deface.process_image(
+                input_path=input_path,
+                output_path=output_path,
+                threshold=threshold,
+                replacewith=replacewith,
+                mask_scale=mask_scale,
+                ellipse=ellipse,
+                draw_scores=False,
+                # Add other parameters as needed
+            )
+            
+            self.status_label.setText(f"Successfully processed: {os.path.basename(output_path)}")
+            
+            # Update preview if applicable
+            self.update_image_preview(output_path)
+            
+        except Exception as e:
+            self.status_label.setText(f"Error: {str(e)}")
+    
+    def get_selected_method(self):
+        # Map UI selection to deface method (adjust based on your UI)
+        methods = {
+            "Blur": "blur",
+            "Solid": "solid",
+            "None": "none",
+            "Custom Image": "img",
+            "Mosaic": "mosaic"
+        }
+        selected = self.method_combobox.currentText()
+        return methods.get(selected, "blur")
 
 
 if __name__ == "__main__":
