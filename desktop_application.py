@@ -18,7 +18,11 @@ from PyQt6.QtGui import QImage, QPixmap, QColor, QFont, QIcon
 # Import the frame extraction app
 from frame_extraction import FrameExtractionApp
 from face_anonymizer_images import FaceAnonymizationBatchApp
-from deface_integration import DefaceIntegration
+from face_anonymizer_videos import FaceAnonymizationVideoApp
+
+# Import deface module directly
+from centerface import CenterFace
+import deface
 
 class VideoProcessingThread(QThread):
     """Thread for processing videos with deface without freezing the UI"""
@@ -27,13 +31,12 @@ class VideoProcessingThread(QThread):
     processing_finished = pyqtSignal(str)
     log_message = pyqtSignal(str)
     
-    def __init__(self, input_file, output_file, options, deface_integration=None):
+    def __init__(self, input_file, output_file, options):
         super().__init__()
         self.input_file = input_file
         self.output_file = output_file
         self.options = options
         self.is_running = True
-        self.deface_integration = deface_integration or DefaceIntegration()
     
     def run(self):
         try:
@@ -44,102 +47,172 @@ class VideoProcessingThread(QThread):
             
             self.log_message.emit(f"Processing video: {os.path.basename(self.input_file)}")
             
-            # Get frame count if possible for update interval calculation
+            # Configure options for deface module
+            threshold = self.options["threshold"]
+            mask_scale = self.options["mask_scale"]
+            replacewith = self.options["anonymization_method"]
+            ellipse = not self.options["box_method"]
+            draw_scores = self.options["draw_scores"]
+            mosaicsize = self.options["mosaic_size"] if "mosaic_size" in self.options else 20
+            
+            # Prepare scale parameter
+            scale = None
+            if self.options["scale"] and self.options["scale"] != "None":
+                scale = self.options["scale"]
+            
+            # Configure ffmpeg_config
+            ffmpeg_config = {"codec": "libx264"}
+            
+            # Create CenterFace instance
+            centerface = CenterFace(in_shape=scale)
+            
+            # Use video_detect from deface module directly
+            class CustomVideoProcessingCallback:
+                def __init__(self, thread_instance):
+                    self.thread = thread_instance
+                    self.frame_count = 0
+                    self.total_frames = 0
+                    
+                def update_progress(self, progress):
+                    self.thread.progress_updated.emit(progress)
+                    
+                def process_frame(self, frame):
+                    # Increment frame counter
+                    self.frame_count += 1
+                    
+                    # Send frame for preview
+                    if hasattr(frame, 'shape'):
+                        h, w = frame.shape[:2]
+                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        bytes_per_line = 3 * w
+                        qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                        self.thread.frame_processed.emit(qt_image, self.frame_count, self.total_frames)
+                    
+                    # Update progress
+                    if self.total_frames > 0:
+                        progress = min(int((self.frame_count / self.total_frames) * 100), 99)
+                        self.thread.progress_updated.emit(progress)
+                    
+                    # Log frame info (less frequently to avoid flooding)
+                    if self.frame_count % 30 == 0:
+                        if self.total_frames > 0:
+                            self.thread.log_message.emit(f"Processing frame: {self.frame_count}/{self.total_frames} " +
+                                                         f"({(self.frame_count/self.total_frames*100):.1f}%)")
+                        else:
+                            self.thread.log_message.emit(f"Processing frame: {self.frame_count}")
+                    
+                    return self.thread.is_running  # Return False to stop processing
+            
+            # Create callback instance
+            callback = CustomVideoProcessingCallback(self)
+            
+            # Get total frames for progress tracking
             try:
+                cap = cv2.VideoCapture(self.input_file)
+                if cap.isOpened():
+                    callback.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    cap.release()
+            except Exception as e:
+                self.log_message.emit(f"Could not determine total frames: {str(e)}")
+            
+            # Use our custom function to enable frame-by-frame processing with callbacks
+            def custom_video_detect():
+                # Initialize video reader
+                import imageio
                 reader = imageio.get_reader(self.input_file)
-                frame_count = reader.count_frames()
-                reader.close()
+                meta = reader.get_meta_data()
                 
-                # Update every ~1% of frames, with limits
-                update_interval = max(1, min(frame_count // 100, 30))
-            except:
-                update_interval = 30  # Default if frame count unknown
+                # Initialize video writer
+                writer = imageio.get_writer(
+                    self.output_file, format='FFMPEG', 
+                    mode='I', fps=meta.get('fps', 30),
+                    codec='libx264'
+                )
+                
+                # Process each frame
+                frame_idx = 0
+                for frame in reader:
+                    if not self.is_running:
+                        break
+                    
+                    # Detect faces
+                    dets, _ = centerface(frame, threshold=threshold)
+                    
+                    # Anonymize faces
+                    deface.anonymize_frame(
+                        dets, frame, mask_scale=mask_scale,
+                        replacewith=replacewith, ellipse=ellipse, 
+                        draw_scores=draw_scores, replaceimg=None,
+                        mosaicsize=mosaicsize
+                    )
+                    
+                    # Write frame to output
+                    writer.append_data(frame)
+                    
+                    # Call callback
+                    frame_idx += 1
+                    callback.process_frame(frame)
+                
+                # Cleanup
+                reader.close()
+                writer.close()
+                
+                return frame_idx
             
-            # Custom progress callback with reduced update frequency
-            def progress_callback(progress):
-                # Only update UI every update_interval percent
-                if progress % update_interval == 0 or progress == 100:
-                    self.progress_updated.emit(progress)
-            
-            # Process the video using our integration
-            self.deface_integration.process_video(
-                input_path=self.input_file,
-                output_path=self.output_file,
-                threshold=self.options["threshold"],
-                replacewith=self.options["anonymization_method"],
-                mask_scale=self.options["mask_scale"],
-                ellipse=not self.options["box_method"],
-                draw_scores=self.options["draw_scores"],
-                keep_audio=True,
-                replaceimg=None,
-                mosaicsize=self.options.get("mosaic_size", 20),
-                progress_callback=progress_callback,
-                batch_size=4  # Process 4 frames at once for better efficiency
-            )
-            
-            self.log_message.emit("Video processing completed successfully")
-            self.progress_updated.emit(100)
-            self.processing_finished.emit("Video processing completed")
-            
+            # Run the processing
+            self.log_message.emit(f"Starting video processing with deface module...")
+            try:
+                frames_processed = custom_video_detect()
+                self.log_message.emit(f"Video processing completed. Processed {frames_processed} frames.")
+                self.progress_updated.emit(100)  # Ensure 100% at the end
+                self.processing_finished.emit("Video processing completed")
+            except Exception as e:
+                error_msg = f"Error during video processing: {str(e)}"
+                self.log_message.emit(error_msg)
+                self.processing_finished.emit("Processing failed")
+        
         except Exception as e:
             error_msg = f"Error during video processing: {str(e)}"
             self.log_message.emit(error_msg)
             self.processing_finished.emit(error_msg)
     
-    def update_progress(self, progress):
-        """Handle progress updates from the processing function"""
-        self.progress_updated.emit(progress)
-        
-        # You could also update frame previews here if needed
-        # For now we'll just emit the progress updates
-    
     def stop(self):
         """Stop the processing"""
         self.is_running = False
 
-class WelcomeScreen(QWidget):
-    """Welcome screen widget that appears when the app launches"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.init_ui()
+
+class WelcomeWindow(QMainWindow):
+    """Welcome screen for the Privacy Lens application"""
+    
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Privacy Lens - Face Anonymization Tool")
+        self.setMinimumSize(800, 600)
         
-    def init_ui(self):
-        layout = QVBoxLayout()
-        
-        # Add some spacing at the top
-        layout.addSpacing(40)
-        
-        # Title label
-        title_label = QLabel("Face Anonymization Tool")
-        title_font = QFont()
-        title_font.setPointSize(24)
-        title_font.setBold(True)
-        title_label.setFont(title_font)
-        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title_label)
-        
-        # Subtitle
-        subtitle_label = QLabel("Powered by deface library")
-        subtitle_font = QFont()
-        subtitle_font.setPointSize(12)
-        subtitle_label.setFont(subtitle_font)
-        subtitle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(subtitle_label)
-        
-        layout.addSpacing(40)
-        
-        # Instructions
-        instructions = QLabel(
-            "This tool allows you to anonymize faces in videos and images.\n"
-            "You can process multiple videos in batch mode and customize anonymization options."
-        )
-        instructions.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        instructions.setWordWrap(True)
-        layout.addWidget(instructions)
-        
-        layout.addSpacing(30)
-        
-        # Button styles
+        # Set dark theme stylesheet
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background-color: #222;
+                color: white;
+            }
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 15px 32px;
+                text-align: center;
+                font-size: 16px;
+                margin: 4px 2px;
+                border-radius: 8px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QLabel {
+                color: white;
+            }
+        """)
+
         button_style = """
             QPushButton {
                 background-color: #4CAF50;
@@ -153,1036 +226,303 @@ class WelcomeScreen(QWidget):
             }
         """
         
-        # Get started button
-        self.start_button = QPushButton("Video Face Anonymization")
-        self.start_button.setMinimumSize(300, 50)
-        self.start_button.setStyleSheet(button_style)
+        # Create central widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
         
-        # Frame extraction button
-        self.extract_frames_button = QPushButton("Extract Frames from Videos")
-        self.extract_frames_button.setMinimumSize(300, 50)
-        self.extract_frames_button.setStyleSheet(button_style)
-        
-        # Image anonymization button
-        self.image_anon_button = QPushButton("Image Face Anonymization")
-        self.image_anon_button.setMinimumSize(300, 50)
-        self.image_anon_button.setStyleSheet(button_style)
+        # Main layout
+        layout = QVBoxLayout(central_widget)
+        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setSpacing(20)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Center everything in the layout
 
-        # Update the buttons layout to include the new button
-        buttons_layout = QVBoxLayout()
+        # Add equal stretch at top to push content to center
+        layout.addStretch(1)
+
+        # Title
+        title_label = QLabel("Privacy Lens - Face Anonymization Tool")
+        title_label.setFont(QFont("Arial", 24, QFont.Weight.Bold))
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Subtitle
+        subtitle_label = QLabel("Powered by deface library")
+        subtitle_label.setFont(QFont("Arial", 14))
+        subtitle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Description
+        desc_label = QLabel("This tool allows you to anonymize faces in videos and images.\n"
+                           "You can process multiple videos in batch mode and customize anonymization options.")
+        desc_label.setFont(QFont("Arial", 12))
+        desc_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Add widgets with center alignment
+        layout.addWidget(title_label, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(subtitle_label, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addSpacing(40)
+        layout.addWidget(desc_label, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addSpacing(40)
+
+        # Buttons container with center alignment
+        buttons_container = QWidget()
+        buttons_layout = QVBoxLayout(buttons_container)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
         buttons_layout.setSpacing(20)
+        buttons_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        button_container_layout1 = QHBoxLayout()
-        button_container_layout1.addStretch()
-        button_container_layout1.addWidget(self.start_button)
-        button_container_layout1.addStretch()
+        # Add buttons with fixed sizes
+        self.video_button = QPushButton("Video Face Anonymization")
+        self.video_button.setFixedSize(400, 70)
+        self.video_button.clicked.connect(self.open_video_anonymization)
+        self.video_button.setStyleSheet(button_style)
 
-        button_container_layout2 = QHBoxLayout()
-        button_container_layout2.addStretch()
-        button_container_layout2.addWidget(self.extract_frames_button)
-        button_container_layout2.addStretch()
 
-        button_container_layout3 = QHBoxLayout()
-        button_container_layout3.addStretch()
-        button_container_layout3.addWidget(self.image_anon_button)
-        button_container_layout3.addStretch()
+        self.extract_button = QPushButton("Extract Frames from Videos")
+        self.extract_button.setFixedSize(400, 70)
+        self.extract_button.clicked.connect(self.open_frame_extraction)
+        self.extract_button.setStyleSheet(button_style)
 
-        buttons_layout.addLayout(button_container_layout1)
-        buttons_layout.addLayout(button_container_layout2)
-        buttons_layout.addLayout(button_container_layout3)
+        self.image_button = QPushButton("Image Face Anonymization")
+        self.image_button.setFixedSize(400, 70)
+        self.image_button.clicked.connect(self.open_image_anonymization)
+        self.image_button.setStyleSheet(button_style)
 
-        layout.addLayout(buttons_layout)
-        
-        # Version info at bottom
-        layout.addStretch()
+        buttons_layout.addWidget(self.video_button)
+        buttons_layout.addWidget(self.extract_button)
+        buttons_layout.addWidget(self.image_button)
+
+        # Add buttons container to main layout with center alignment
+        layout.addWidget(buttons_container, 0, Qt.AlignmentFlag.AlignCenter)
+
+        # Version label
         version_label = QLabel("ACCESS Video Anonymization Tool v1.0")
+        version_label.setFont(QFont("Arial", 10))
         version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(version_label)
-        
-        self.setLayout(layout)
+        layout.addWidget(version_label, 0, Qt.AlignmentFlag.AlignCenter)
 
-class FaceAnonymizationVideoApp(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Face Anonymization Tools")
-        self.setMinimumSize(800, 600)
-        
-        # Create the deface integration
-        self.deface = DefaceIntegration()
-        
-        self.frame_extraction_window = None
-        self.image_anonymization_window = None
-        self.video_anonymization_window = None
-        
-        # Create welcome screen
-        self.welcome_screen = WelcomeScreen()
-        self.welcome_screen.start_button.clicked.connect(self.open_video_anonymization)
-        self.welcome_screen.extract_frames_button.clicked.connect(self.open_frame_extraction)
-        self.welcome_screen.image_anon_button.clicked.connect(self.open_image_anonymization)
-        
-        self.setCentralWidget(self.welcome_screen)
+        # Add equal stretch at bottom to push content to center
+        layout.addStretch(1)
     
     def open_video_anonymization(self):
-        """Open the video anonymization tool in a separate window"""
-        if not self.video_anonymization_window or not self.video_anonymization_window.isVisible():
-            self.video_anonymization_window = VideoAnonymizationApp()
-            self.video_anonymization_window.set_deface_integration(self.deface)
-            self.video_anonymization_window.show()
-        else:
-            self.video_anonymization_window.setWindowState(self.video_anonymization_window.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
-            self.video_anonymization_window.activateWindow()
+        try:
+            self.video_window = FaceAnonymizationVideoApp()
+            # Set the icon
+            if hasattr(self, 'windowIcon') and not self.windowIcon().isNull():
+                self.video_window.setWindowIcon(self.windowIcon())
+            # Show the main screen
+            self.video_window.show_main_screen()
+            # Show maximized instead of fullscreen
+            self.video_window.showMaximized()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not open video anonymization: {str(e)}")
     
     def open_frame_extraction(self):
-        """Open the frame extraction tool in a separate window"""
-        if not self.frame_extraction_window or not self.frame_extraction_window.isVisible():
-            self.frame_extraction_window = FrameExtractionApp()
-            self.frame_extraction_window.show()
-        else:
-            self.frame_extraction_window.setWindowState(self.frame_extraction_window.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
-            self.frame_extraction_window.activateWindow()
+        """Open the frame extraction window"""
+        try:
+            self.extract_window = QMainWindow()
+            self.extract_window.setWindowTitle("Extract Frames from Videos")
+            self.extract_window.setMinimumSize(800, 600)
+            
+            # Create and set the central widget
+            extract_widget = FrameExtractionApp()
+            self.extract_window.setCentralWidget(extract_widget)
+            
+            # Show the window
+            self.extract_window.showMaximized()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not open frame extraction: {str(e)}")
     
     def open_image_anonymization(self):
-        """Open the image face anonymization tool in a separate window"""
-        if not self.image_anonymization_window or not self.image_anonymization_window.isVisible():
-            self.image_anonymization_window = FaceAnonymizationBatchApp()
-            self.image_anonymization_window.show()
-        else:
-            self.image_anonymization_window.setWindowState(self.image_anonymization_window.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
-            self.image_anonymization_window.activateWindow()
+        """Open the image anonymization window"""
+        try:
+            self.image_window = QMainWindow()
+            self.image_window.setWindowTitle("Image Face Anonymization")
+            self.image_window.setMinimumSize(800, 600)
             
-# Add this class to separate video functionality
-class VideoAnonymizationApp(QMainWindow):
-    """Standalone window for video anonymization"""
+            # Create and set the central widget
+            image_widget = FaceAnonymizationBatchApp()
+            self.image_window.setCentralWidget(image_widget)
+            
+            # Show the window
+            self.image_window.showMaximized()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not open image anonymization: {str(e)}")
+    
+    def set_window_icon(self, window):
+        """Set icon for a child window"""
+        if hasattr(self, 'windowIcon') and not self.windowIcon().isNull():
+            window.setWindowIcon(self.windowIcon())
+
+
+class VideoProcessingApp(QWidget):
+    """Application for processing videos with face anonymization"""
+    
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Video Face Anonymization (powered by deface)")
-        self.setMinimumSize(1000, 700)
+        self.setWindowTitle("Video Face Anonymization")
         
+        # Create layout
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+        
+        # Add a title label
+        title = QLabel("Privacy Lens - Video Face Anonymization")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setFont(QFont("Arial", 16))
+        layout.addWidget(title)
+        
+        # Add file selection buttons
+        file_layout = QHBoxLayout()
+        self.input_btn = QPushButton("Select Input Video")
+        self.input_btn.clicked.connect(self.select_input_file)
+        file_layout.addWidget(self.input_btn)
+        
+        self.output_btn = QPushButton("Select Output Location")
+        self.output_btn.clicked.connect(self.select_output_file)
+        file_layout.addWidget(self.output_btn)
+        layout.addLayout(file_layout)
+        
+        # Add file path displays
+        self.input_label = QLabel("No input file selected")
+        layout.addWidget(self.input_label)
+        
+        self.output_label = QLabel("No output location selected")
+        layout.addWidget(self.output_label)
+        
+        # Add options
+        self.setup_options(layout)
+        
+        # Add processing button
+        self.process_btn = QPushButton("Start Processing")
+        self.process_btn.clicked.connect(self.start_processing)
+        layout.addWidget(self.process_btn)
+        
+        # Add progress bar
+        self.progress = QProgressBar()
+        layout.addWidget(self.progress)
+        
+        # Add log
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        layout.addWidget(self.log)
+        
+        # Initialize variables
         self.input_file = ""
         self.output_file = ""
-        self.is_processing = False
         self.processing_thread = None
-        
-        # Check if deface is installed
-        try:
-            result = subprocess.run(
-                ["deface", "--version"], 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE, 
-                text=True,
-                check=True
-            )
-            self.deface_version = result.stdout.strip()
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            QMessageBox.critical(
-                self,
-                "Deface Not Found",
-                "The deface library was not found. Please install it using:\n\npython -m pip install deface"
-            )
-            return
-        
-        self.has_ffmpeg = False
-        try:
-            result = subprocess.run(
-                ["ffmpeg", "-version"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            if result.returncode == 0:
-                self.has_ffmpeg = True
-        except (subprocess.SubprocessError, FileNotFoundError):
-            pass
-            
-        # Create the main widget
-        self.main_widget = QWidget()
-        self.setCentralWidget(self.main_widget)
-        
-        # Initialize UI
-        self.init_ui()
-        
-        # Log application startup
-        self.append_log(f"Video Face Anonymization App started (powered by deface {self.deface_version})")
-        self.append_log("Ready to process videos")
     
-    # Copy all the relevant UI and processing methods from FaceAnonymizationVideoApp
-    # But remove the welcome screen related code
-    def init_ui(self):
-        """Initialize the UI components"""
-        main_layout = QVBoxLayout()
-
-        # Set main layout
-        self.main_widget.setLayout(main_layout)
-
-        # File selection
-        file_group = QGroupBox("File Selection")
-        file_layout = QVBoxLayout()
-        
-        input_layout = QHBoxLayout()
-        self.input_label = QLabel("Input video:")
-        self.input_path_label = QLabel("No file selected")
-        input_layout.addWidget(self.input_label)
-        input_layout.addWidget(self.input_path_label, 1)
-        
-        # Add a button for multiple file selection
-        self.browse_multiple_btn = QPushButton("Add Multiple Videos")
-        self.browse_multiple_btn.clicked.connect(self.browse_multiple_files)
-        input_layout.addWidget(self.browse_multiple_btn)
-        
-        output_layout = QHBoxLayout()
-        self.output_label = QLabel("Output folder:")
-        self.output_path_label = QLabel("No folder selected")
-        self.browse_output_btn = QPushButton("Browse")
-        self.browse_output_btn.clicked.connect(self.browse_output_folder)  # Changed to select folder
-        output_layout.addWidget(self.output_label)
-        output_layout.addWidget(self.output_path_label, 1)
-        output_layout.addWidget(self.browse_output_btn)
-        
-        # Add a batch processing list widget
-        batch_layout = QVBoxLayout()
-        batch_layout.addWidget(QLabel("Batch Processing Queue:"))
-        self.batch_list = QListWidget()
-        self.batch_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self.batch_list.setMinimumHeight(100)
-        batch_layout.addWidget(self.batch_list)
-        
-        # Add buttons to manage the batch list
-        batch_buttons_layout = QHBoxLayout()
-        self.remove_selected_btn = QPushButton("Remove Selected")
-        self.remove_selected_btn.clicked.connect(self.remove_selected_videos)
-        self.clear_batch_btn = QPushButton("Clear All")
-        self.clear_batch_btn.clicked.connect(self.clear_batch)
-        self.move_up_btn = QPushButton("Move Up")
-        self.move_up_btn.clicked.connect(self.move_item_up)
-        self.move_down_btn = QPushButton("Move Down")
-        self.move_down_btn.clicked.connect(self.move_item_down)
-        
-        batch_buttons_layout.addWidget(self.remove_selected_btn)
-        batch_buttons_layout.addWidget(self.clear_batch_btn)
-        batch_buttons_layout.addWidget(self.move_up_btn)
-        batch_buttons_layout.addWidget(self.move_down_btn)
-        batch_layout.addLayout(batch_buttons_layout)
-        
-        file_layout.addLayout(input_layout)
-        file_layout.addLayout(output_layout)
-        file_layout.addLayout(batch_layout)
-        file_group.setLayout(file_layout)
-        
-        # Processing options
+    def setup_options(self, layout):
+        # Add processing options
         options_group = QGroupBox("Anonymization Options")
         options_layout = QVBoxLayout()
-        
-        # Anonymization method
-        anon_layout = QHBoxLayout()
-        anon_layout.addWidget(QLabel("Anonymization Method:"))
-        self.anon_method = QComboBox()
-        self.anon_method.addItems(["blur", "solid", "mosaic", "none"])
-        self.anon_method.currentTextChanged.connect(self.update_ui_based_on_method)
-        anon_layout.addWidget(self.anon_method)
-        
-        # Mosaic size (only visible when mosaic method selected)
-        self.mosaic_layout = QHBoxLayout()
-        self.mosaic_layout.addWidget(QLabel("Mosaic Size:"))
-        self.mosaic_size = QSpinBox()
-        self.mosaic_size.setMinimum(5)
-        self.mosaic_size.setMaximum(100)
-        self.mosaic_size.setValue(20)
-        self.mosaic_layout.addWidget(self.mosaic_size)
-        
-        # Detection threshold
-        thresh_layout = QHBoxLayout()
-        thresh_layout.addWidget(QLabel("Detection Threshold:"))
-        self.threshold_slider = QSlider(Qt.Orientation.Horizontal)
-        self.threshold_slider.setMinimum(1)
-        self.threshold_slider.setMaximum(99)
-        self.threshold_slider.setValue(20)  # Default 0.2
-        self.threshold_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.threshold_slider.setTickInterval(10)
-        self.threshold_value_label = QLabel("0.2")
-        self.threshold_slider.valueChanged.connect(self.update_threshold_value)
-        thresh_layout.addWidget(self.threshold_slider)
-        thresh_layout.addWidget(self.threshold_value_label)
-        
-        # Mask scale
-        mask_layout = QHBoxLayout()
-        mask_layout.addWidget(QLabel("Mask Scale:"))
-        self.mask_scale_slider = QSlider(Qt.Orientation.Horizontal)
-        self.mask_scale_slider.setMinimum(10)
-        self.mask_scale_slider.setMaximum(30)
-        self.mask_scale_slider.setValue(13)  # Default 1.3
-        self.mask_scale_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.mask_scale_slider.setTickInterval(5)
-        self.mask_scale_value_label = QLabel("1.3")
-        self.mask_scale_slider.valueChanged.connect(self.update_mask_scale_value)
-        mask_layout.addWidget(self.mask_scale_slider)
-        mask_layout.addWidget(self.mask_scale_value_label)
-        
-        # Downscaling for performance
-        scale_layout = QHBoxLayout()
-        scale_layout.addWidget(QLabel("Downscale for Detection:"))
-        self.scale_combo = QComboBox()
-        self.scale_combo.addItems(["None", "640x360", "1280x720", "1920x1080"])
-        scale_layout.addWidget(self.scale_combo)
-        
-        # Checkboxes for options
-        checks_layout = QVBoxLayout()
-        
-        self.box_check = QCheckBox("Use boxes instead of ellipse masks")
-        checks_layout.addWidget(self.box_check)
-        
-        self.draw_scores_check = QCheckBox("Draw detection scores")
-        checks_layout.addWidget(self.draw_scores_check)
-        
-        # Add all layouts to options
-        options_layout.addLayout(anon_layout)
-        options_layout.addLayout(self.mosaic_layout)
-        options_layout.addLayout(thresh_layout)
-        options_layout.addLayout(mask_layout)
-        options_layout.addLayout(scale_layout)
-        options_layout.addLayout(checks_layout)
         options_group.setLayout(options_layout)
         
-        # Update UI to hide mosaic settings initially
-        self.update_ui_based_on_method("blur")
+        # Method selection
+        method_layout = QHBoxLayout()
+        method_label = QLabel("Method:")
+        self.method_combo = QComboBox()
+        self.method_combo.addItems(["blur", "solid", "mosaic"])
+        method_layout.addWidget(method_label)
+        method_layout.addWidget(self.method_combo)
+        options_layout.addLayout(method_layout)
         
-        # Preview
-        preview_group = QGroupBox("Video Preview")
-        preview_layout = QVBoxLayout()
+        # Blur intensity
+        blur_layout = QHBoxLayout()
+        blur_label = QLabel("Blur Intensity:")
+        self.blur_slider = QSlider(Qt.Orientation.Horizontal)
+        self.blur_slider.setRange(1, 10)
+        self.blur_slider.setValue(5)
+        self.blur_slider.setTickInterval(1)
+        self.blur_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        blur_layout.addWidget(blur_label)
+        blur_layout.addWidget(self.blur_slider)
+        options_layout.addLayout(blur_layout)
         
-        self.preview_label = QLabel()
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumSize(640, 360)
-        self.preview_label.setStyleSheet("background-color: #f0f0f0;")
-        self.preview_label.setText("Video preview will appear here during processing")
-        preview_layout.addWidget(self.preview_label)
-        preview_group.setLayout(preview_layout)
+        # Threshold
+        thresh_layout = QHBoxLayout()
+        thresh_label = QLabel("Detection Threshold:")
+        self.thresh_slider = QSlider(Qt.Orientation.Horizontal)
+        self.thresh_slider.setRange(1, 10)
+        self.thresh_slider.setValue(5)
+        self.thresh_slider.setTickInterval(1)
+        self.thresh_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        thresh_layout.addWidget(thresh_label)
+        thresh_layout.addWidget(self.thresh_slider)
+        options_layout.addLayout(thresh_layout)
         
-        # Progress
-        progress_layout = QHBoxLayout()
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setTextVisible(True)
-        self.status_label = QLabel("Ready")
-        self.frame_counter_label = QLabel("Frame: 0/0")
-        self.frame_counter_label.setMinimumWidth(150)  # Ensure enough space for frame counts
-        progress_layout.addWidget(self.progress_bar)
-        progress_layout.addWidget(self.status_label)
-        progress_layout.addWidget(self.frame_counter_label)
-        
-        # Control buttons
-        buttons_layout = QHBoxLayout()
-        
-        # Add a batch process button
-        self.batch_process_btn = QPushButton("Process All Videos")
-        self.batch_process_btn.clicked.connect(self.start_batch_processing)
-        self.batch_process_btn.setEnabled(False)
-        buttons_layout.addWidget(self.batch_process_btn)
-
-        self.about_btn = QPushButton("About deface")
-        self.about_btn.clicked.connect(self.show_about)
-        
-        self.force_stop_btn = QPushButton("Force Stop")
-        self.force_stop_btn.setEnabled(False)
-        self.force_stop_btn.clicked.connect(self.stop_processing)
-        self.force_stop_btn.setStyleSheet("background-color: #ff6666;")
-        
-        buttons_layout.addWidget(self.force_stop_btn)
-        buttons_layout.addWidget(self.about_btn)
-        
-        # Log area
-        log_group = QGroupBox("Log")
-        log_layout = QVBoxLayout()
-        self.log_text = QPlainTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMaximumBlockCount(1000)  # Limit to prevent memory issues
-        self.log_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        log_layout.addWidget(self.log_text)
-        
-        # Clear log button
-        clear_log_btn = QPushButton("Clear Log")
-        clear_log_btn.clicked.connect(self.log_text.clear)
-        log_layout.addWidget(clear_log_btn)
-        log_group.setLayout(log_layout)
-        
-        # Add all components to main layout
-        main_layout.addWidget(file_group)
-        main_layout.addWidget(options_group)
-        main_layout.addWidget(preview_group)
-        main_layout.addWidget(log_group)
-        main_layout.addLayout(progress_layout)
-        main_layout.addLayout(buttons_layout)
-        
-        # Set main layout
-        self.main_widget.setLayout(main_layout)
-        
-        # Log application startup
-        self.append_log(f"Video Face Anonymization App started (powered by deface {self.deface_version})")
-        self.append_log("Ready to process videos")
-
-    def open_image_anonymization(self):
-        """Open the image face anonymization tool in a separate window"""
-        # Create a new instance of the image anonymization app if it doesn't exist or was closed
-        if not self.image_anonymization_window or not self.image_anonymization_window.isVisible():
-            self.image_anonymization_window = FaceAnonymizationBatchApp()
-            self.image_anonymization_window.show()
-        else:
-            # If window exists, bring it to front
-            self.image_anonymization_window.setWindowState(self.image_anonymization_window.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
-            self.image_anonymization_window.activateWindow()
-            
-        self.append_log("Opened Image Face Anonymization Tool")
-        
-    def open_frame_extraction(self):
-        """Open the frame extraction tool in a separate window"""
-        # Create a new instance of the frame extraction app if it doesn't exist or was closed
-        if not self.frame_extraction_window or not self.frame_extraction_window.isVisible():
-            self.frame_extraction_window = FrameExtractionApp()
-            self.frame_extraction_window.show()
-        else:
-            # If window exists, bring it to front
-            self.frame_extraction_window.setWindowState(self.frame_extraction_window.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
-            self.frame_extraction_window.activateWindow()
-            
-        self.append_log("Opened Frame Extraction Tool")
-
-    def browse_multiple_files(self):
-        """Open file dialog to select multiple input video files"""
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select Input Videos", "", "Video Files (*.mp4 *.avi *.mov *.mkv *.webm);;All Files (*.*)"
+        layout.addWidget(options_group)
+    
+    def select_input_file(self):
+        file, _ = QFileDialog.getOpenFileName(
+            self, "Select Input Video", "", "Video Files (*.mp4 *.avi *.mov *.mkv);;All Files (*)"
         )
-        if file_paths:
-            # Add the files to the batch processing list
-            for file_path in file_paths:
-                self.add_to_batch(file_path)
-            
-            self.append_log(f"Added {len(file_paths)} videos to batch processing queue")
-            self.update_batch_process_button()
+        if file:
+            self.input_file = file
+            self.input_label.setText(file)
+            self.log_message(f"Input file selected: {file}")
     
-    def add_to_batch(self, file_path):
-        """Add a file to the batch processing list"""
-        # Check if the file is already in the list
-        for i in range(self.batch_list.count()):
-            item = self.batch_list.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == file_path:
-                # Already exists
-                return
-        
-        # Add the file to the list
-        item = QListWidgetItem(os.path.basename(file_path))
-        item.setData(Qt.ItemDataRole.UserRole, file_path)
-        self.batch_list.addItem(item)
-    
-    def remove_selected_videos(self):
-        """Remove selected videos from the batch list"""
-        selected_items = self.batch_list.selectedItems()
-        if not selected_items:
-            return
-        
-        for item in selected_items:
-            row = self.batch_list.row(item)
-            self.batch_list.takeItem(row)
-        
-        self.append_log(f"Removed {len(selected_items)} video(s) from batch queue")
-        self.update_batch_process_button()
-    
-    def clear_batch(self):
-        """Clear all videos from the batch list"""
-        count = self.batch_list.count()
-        if count > 0:
-            self.batch_list.clear()
-            self.append_log(f"Cleared all {count} videos from batch queue")
-            self.update_batch_process_button()
-    
-    def move_item_up(self):
-        """Move the selected item up in the batch list"""
-        current_row = self.batch_list.currentRow()
-        if current_row > 0:
-            item = self.batch_list.takeItem(current_row)
-            self.batch_list.insertItem(current_row - 1, item)
-            self.batch_list.setCurrentItem(item)
-    
-    def move_item_down(self):
-        """Move the selected item down in the batch list"""
-        current_row = self.batch_list.currentRow()
-        if current_row < self.batch_list.count() - 1:
-            item = self.batch_list.takeItem(current_row)
-            self.batch_list.insertItem(current_row + 1, item)
-            self.batch_list.setCurrentItem(item)
-    
-    def browse_output_folder(self):
-        """Open folder dialog to select output directory"""
-        folder_path = QFileDialog.getExistingDirectory(
-            self, "Select Output Folder", ""
+    def select_output_file(self):
+        file, _ = QFileDialog.getSaveFileName(
+            self, "Select Output Location", "", "Video Files (*.mp4);;All Files (*)"
         )
-        if folder_path:
-            self.output_file = folder_path
-            self.output_path_label.setText(os.path.basename(folder_path))
-            self.append_log(f"Output folder set to: {folder_path}")
-            self.update_batch_process_button()
+        if file:
+            if not file.endswith('.mp4'):
+                file += '.mp4'
+            self.output_file = file
+            self.output_label.setText(file)
+            self.log_message(f"Output location selected: {file}")
     
-    def update_batch_process_button(self):
-        """Update the batch process button state based on list and output folder"""
-        has_videos = self.batch_list.count() > 0
-        has_output = bool(self.output_file)
-        
-        self.batch_process_btn.setEnabled(has_videos and has_output)
+    def log_message(self, message):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.log.appendPlainText(f"[{timestamp}] {message}")
     
-    def start_batch_processing(self):
-        """Start processing all videos in the batch list"""
-        if self.is_processing:
-            self.stop_processing()
-            return
-        
-        if self.batch_list.count() == 0:
-            QMessageBox.warning(self, "No Videos", "No videos in the batch processing queue.")
+    def start_processing(self):
+        if not self.input_file:
+            QMessageBox.warning(self, "No Input", "Please select an input video file.")
             return
         
         if not self.output_file:
-            QMessageBox.warning(self, "No Output Folder", "Please select an output folder.")
+            QMessageBox.warning(self, "No Output", "Please select an output location.")
             return
         
-        # Start batch processing
-        self.current_batch_index = 0
-        self.is_processing = True
-        self.batch_process_btn.setText("Stop Batch Processing")
+        # Disable buttons during processing
+        self.process_btn.setEnabled(False)
+        self.input_btn.setEnabled(False)
+        self.output_btn.setEnabled(False)
         
-        # Disable UI elements during batch processing
-        self.disable_ui_during_processing(True)
-        
-        # Start processing the first video
-        self.process_next_batch_video()
-    
-    def process_next_batch_video(self):
-        """Process the next video in the batch queue"""
-        if not self.is_processing or self.current_batch_index >= self.batch_list.count():
-            # We're done or stopped
-            self.batch_processing_complete()
-            return
-        
-        # Get the next video from the queue
-        item = self.batch_list.item(self.current_batch_index)
-        input_file = item.data(Qt.ItemDataRole.UserRole)
-        
-        # Set the item background to indicate it's being processed
-        item.setBackground(QColor(255, 255, 200))  # Light yellow
-        self.batch_list.scrollToItem(item)
-        
-        # Generate output filename
-        input_name = os.path.basename(input_file)
-        input_base = os.path.splitext(input_name)[0]
-        input_ext = os.path.splitext(input_name)[1]
-        output_file = os.path.join(
-            self.output_file,
-            f"{input_base}_anonymized{input_ext}"
-        )
-        
-        # Set as current files
-        self.input_file = input_file
-        self.output_file_current = output_file  # Store current output file separately
-        
-        # Update labels
-        self.input_path_label.setText(os.path.basename(input_file))
-        self.status_label.setText(f"Processing video {self.current_batch_index + 1} of {self.batch_list.count()}")
-        
-        # Log
-        self.append_log(f"Batch processing: Starting video {self.current_batch_index + 1} of {self.batch_list.count()}")
-        self.append_log(f"Input: {input_file}")
-        self.append_log(f"Output: {output_file}")
-        
-        # Show thumbnail
-        self.show_video_thumbnail(input_file)
-        
-        # Gather options
+        # Get processing options
         options = {
-            "threshold": float(self.threshold_value_label.text()),
-            "mask_scale": float(self.mask_scale_value_label.text()),
-            "anonymization_method": self.anon_method.currentText(),
-            "mosaic_size": self.mosaic_size.value(),
-            "box_method": self.box_check.isChecked(),
-            "draw_scores": self.draw_scores_check.isChecked(),
-            "scale": self.scale_combo.currentText() if self.scale_combo.currentIndex() > 0 else ""
+            "threshold": self.thresh_slider.value() / 10,  # Convert 1-10 to 0.1-1.0
+            "mask_scale": 1.3,
+            "anonymization_method": self.method_combo.currentText(),
+            "box_method": False,  # Could add option for this
+            "draw_scores": False,  # Could add option for this
+            "blur_intensity": self.blur_slider.value(),
+            "scale": None  # Could add option for this
         }
         
-        # Reset progress bar
-        self.progress_bar.setValue(0)
-        self.frame_counter_label.setText("Frame: 0/0")
-        
-        # Create and start the processing thread
-        self.processing_thread = VideoProcessingThread(
-            input_file,
-            output_file,
-            options
-        )
-        
-        # Connect signals
-        self.processing_thread.progress_updated.connect(self.update_progress)
-        self.processing_thread.frame_processed.connect(self.update_frame_preview)
-        self.processing_thread.processing_finished.connect(self.batch_video_finished)
-        self.processing_thread.log_message.connect(self.append_log)
-        
-        # Start processing
-        self.processing_thread.start()
-        
-        # Enable force stop button
-        self.force_stop_btn.setEnabled(True)
-    
-    def batch_video_finished(self, message):
-        """Handle when a video in the batch is finished"""
-        # Mark the current video as done
-        if 0 <= self.current_batch_index < self.batch_list.count():
-            item = self.batch_list.item(self.current_batch_index)
-            if "completed" in message.lower():
-                # Success
-                item.setBackground(QColor(200, 255, 200))  # Light green
-                self.append_log(f"Successfully processed: {os.path.basename(item.data(Qt.ItemDataRole.UserRole))}")
-            else:
-                # Error
-                item.setBackground(QColor(255, 200, 200))  # Light red
-                self.append_log(f"Failed to process: {os.path.basename(item.data(Qt.ItemDataRole.UserRole))}")
-        
-        # Move to the next video
-        self.current_batch_index += 1
-        
-        if self.is_processing and self.current_batch_index < self.batch_list.count():
-            # Process the next video
-            QTimer.singleShot(1000, self.process_next_batch_video)  # Add a small delay between videos
-        else:
-            # Batch processing complete
-            self.batch_processing_complete()
-    
-    def batch_processing_complete(self):
-        """Handle completion of batch processing"""
-        self.is_processing = False
-        self.batch_process_btn.setText("Process All Videos")
-        self.force_stop_btn.setEnabled(False)
-        
-        # Re-enable UI
-        self.disable_ui_during_processing(False)
-        
-        # Display results
-        if self.current_batch_index > 0:
-            processed_count = self.current_batch_index
-            total_count = self.batch_list.count()
-            remaining = total_count - processed_count
-            
-            status_msg = f"Batch processing complete. Processed {processed_count} of {total_count} videos."
-            self.append_log(status_msg)
-            self.status_label.setText("Batch processing complete")
-            
-            QMessageBox.information(
-                self,
-                "Batch Processing Complete",
-                f"{status_msg}\n\nOutput folder: {self.output_file}"
-            )
-        
-        # Reset batch index
-        self.current_batch_index = -1
-        
-    def processing_finished(self, message):
-        """Handle the end of processing for single video mode"""
-        self.is_processing = False
-        self.status_label.setText(message)
-        
-        # Disable force stop button
-        self.force_stop_btn.setEnabled(False)
-        
-        # Re-enable UI elements
-        self.disable_ui_during_processing(False)
-        
-        # Show a message box if completed successfully
-        if "completed" in message.lower():
-            QMessageBox.information(
-                self,
-                "Processing Complete",
-                f"{message}\n\nOutput file: {self.output_file}"
-            )
-
-    def stop_processing(self):
-        """Stop the video processing"""
-        if self.processing_thread and self.processing_thread.isRunning():
-            self.processing_thread.stop()
-            self.status_label.setText("Stopping processing...")
-            self.append_log("Stopping processing - please wait...")
-            
-        # If in batch mode, reset batch state
-        if self.current_batch_index >= 0:
-            self.append_log("Batch processing stopped by user")
-            self.batch_processing_complete()
-
-    def disable_ui_during_processing(self, disable):
-        """Enable/disable UI elements during processing"""
-        self.browse_output_btn.setEnabled(not disable)
-        self.browse_multiple_btn.setEnabled(not disable)
-        self.anon_method.setEnabled(not disable)
-        self.mosaic_size.setEnabled(not disable)
-        self.threshold_slider.setEnabled(not disable)
-        self.mask_scale_slider.setEnabled(not disable)
-        self.scale_combo.setEnabled(not disable)
-        self.box_check.setEnabled(not disable)
-        self.draw_scores_check.setEnabled(not disable)
-
-        # Disable batch control buttons as well
-        self.remove_selected_btn.setEnabled(not disable)
-        self.clear_batch_btn.setEnabled(not disable)
-        self.move_up_btn.setEnabled(not disable)
-        self.move_down_btn.setEnabled(not disable)
-        self.batch_list.setEnabled(not disable)
-
-    def update_ui_based_on_method(self, method):
-        """Show/hide UI elements based on the selected anonymization method"""
-        # Show mosaic size only when mosaic method is selected
-        for i in range(self.mosaic_layout.count()):
-            item = self.mosaic_layout.itemAt(i)
-            if item:
-                widget = item.widget()
-                if widget:
-                    widget.setVisible(method == "mosaic")
-    
-    def update_threshold_value(self):
-        """Update the threshold value label"""
-        value = self.threshold_slider.value() / 100
-        self.threshold_value_label.setText(f"{value:.2f}")
-    
-    def update_mask_scale_value(self):
-        """Update the mask scale value label"""
-        value = self.mask_scale_slider.value() / 10
-        self.mask_scale_value_label.setText(f"{value:.1f}")
-    
-    def append_log(self, message):
-        """Add a message to the log with timestamp"""
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        formatted_msg = f"[{timestamp}] {message}"
-        self.log_text.appendPlainText(formatted_msg)
-        
-        # Auto-scroll to bottom
-        self.log_text.verticalScrollBar().setValue(
-            self.log_text.verticalScrollBar().maximum()
-        )
-    
-    def show_video_thumbnail(self, video_path):
-        """Show a thumbnail of the first frame of the video"""
-        try:
-            # Try using ffmpeg to get a thumbnail if available (to handle corrupt headers)
-            try:
-                # First attempt: try to use ffmpeg directly if available
-                thumbnail_path = os.path.join(os.path.dirname(video_path), f"temp_thumbnail_{int(time.time())}.jpg")
-                result = subprocess.run(
-                    ["ffmpeg", "-y", "-i", video_path, "-ss", "00:00:01", "-vframes", "1", thumbnail_path],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=5
-                )
-                
-                if os.path.exists(thumbnail_path) and os.path.getsize(thumbnail_path) > 0:
-                    # Load the thumbnail
-                    frame = cv2.imread(thumbnail_path)
-                    if frame is not None:
-                        # Convert to RGB and display
-                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        h, w, ch = frame.shape
-                        qt_image = QImage(frame.data, w, h, ch * w, QImage.Format.Format_RGB888)
-                        pixmap = QPixmap.fromImage(qt_image)
-                        scaled_pixmap = pixmap.scaled(
-                            self.preview_label.size(),
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation
-                        )
-                        self.preview_label.setPixmap(scaled_pixmap)
-                        
-                        # Clean up
-                        try:
-                            os.remove(thumbnail_path)
-                        except:
-                            pass
-                            
-                        # Get video info using ffprobe
-                        try:
-                            result = subprocess.run(
-                                ["ffprobe", "-v", "error", "-select_streams", "v:0", 
-                                 "-show_entries", "stream=width,height,avg_frame_rate,nb_frames", 
-                                 "-of", "csv=p=0", video_path],
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                                timeout=5
-                            )
-                            
-                            if result.returncode == 0 and result.stdout:
-                                info = result.stdout.strip().split(',')
-                                if len(info) >= 4:
-                                    width, height, fps_str, frame_count = info
-                                    
-                                    # Parse FPS (can be in form "30000/1001")
-                                    try:
-                                        if '/' in fps_str:
-                                            num, den = map(float, fps_str.split('/'))
-                                            fps = num / den if den else 0
-                                        else:
-                                            fps = float(fps_str)
-                                    except:
-                                        fps = 0
-                                        
-                                    # Log video properties
-                                    duration_sec = int(frame_count) / fps if fps > 0 and frame_count and frame_count != 'N/A' else 0
-                                    duration_str = time.strftime('%H:%M:%S', time.gmtime(duration_sec))
-                                    
-                                    self.append_log(f"Video properties (from ffprobe):")
-                                    self.append_log(f"  Resolution: {width}x{height}")
-                                    self.append_log(f"  FPS: {fps:.2f}")
-                                    
-                                    if frame_count and frame_count != 'N/A':
-                                        self.append_log(f"  Duration: {duration_str} ({frame_count} frames)")
-                                    else:
-                                        self.append_log(f"  Duration: Unknown (frame count not available)")
-                                        
-                                    return  # Success with ffmpeg/ffprobe
-                        except Exception as e:
-                            self.append_log(f"Error getting video info with ffprobe: {str(e)}")
-                
-            except (subprocess.SubprocessError, FileNotFoundError, Exception) as e:
-                self.append_log(f"Could not use ffmpeg for thumbnail: {str(e)}")
-            
-            # Fallback to OpenCV if ffmpeg failed
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                self.append_log("Warning: OpenCV could not open the video file. The file may be corrupted or use an unsupported codec.")
-                self.preview_label.setText("Could not load video preview\nTry a different video format or check if the file is corrupted")
-                return
-                
-            ret, frame = cap.read()
-            if not ret:
-                self.append_log("Warning: Could not read the first frame of the video.")
-                self.preview_label.setText("Could not read video frame\nThe file may be corrupted")
-                cap.release()
-                return
-                
-            # Get video properties
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            
-            # Log video properties
-            duration_sec = frame_count / fps if fps > 0 and frame_count > 0 else 0
-            duration_str = time.strftime('%H:%M:%S', time.gmtime(duration_sec))
-            
-            self.append_log(f"Video properties (from OpenCV):")
-            self.append_log(f"  Resolution: {width}x{height}")
-            self.append_log(f"  FPS: {fps}")
-            
-            if frame_count > 0:
-                self.append_log(f"  Duration: {duration_str} ({frame_count} frames)")
-            else:
-                self.append_log(f"  Duration: Unknown (frame count not available)")
-            
-            # Convert to RGB
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = frame.shape
-            
-            # Create QImage and QPixmap
-            qt_image = QImage(frame.data, w, h, ch * w, QImage.Format.Format_RGB888)
-            pixmap = QPixmap.fromImage(qt_image)
-            
-            # Scale the pixmap to fit the preview label
-            scaled_pixmap = pixmap.scaled(
-                self.preview_label.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
-            )
-            
-            self.preview_label.setPixmap(scaled_pixmap)
-            cap.release()
-            
-        except Exception as e:
-            self.append_log(f"Error showing video thumbnail: {str(e)}")
-            self.preview_label.setText("Could not load video preview\nThe file may be corrupted or in an unsupported format")
-       
-    def toggle_processing(self):
-        """Start or stop video processing"""
-        if not self.is_processing:
-            self.start_processing()
-        else:
-            self.stop_processing()
-
-        # Gather options
-        options = {
-            "threshold": float(self.threshold_value_label.text()),
-            "mask_scale": float(self.mask_scale_value_label.text()),
-            "anonymization_method": self.anon_method.currentText(),
-            "mosaic_size": self.mosaic_size.value(),
-            "box_method": self.box_check.isChecked(),
-            "draw_scores": self.draw_scores_check.isChecked(),
-            "scale": self.scale_combo.currentText() if self.scale_combo.currentIndex() > 0 else ""
-        }
-        
-        # Create and start the processing thread
-        self.processing_thread = VideoProcessingThread(
-            self.input_file,
-            self.output_file,
-            options
-        )
-        
-        # Connect signals
-        self.processing_thread.progress_updated.connect(self.update_progress)
-        self.processing_thread.frame_processed.connect(self.update_frame_preview)
+        # Start processing thread
+        self.processing_thread = VideoProcessingThread(self.input_file, self.output_file, options)
+        self.processing_thread.progress_updated.connect(self.progress.setValue)
+        self.processing_thread.log_message.connect(self.log_message)
         self.processing_thread.processing_finished.connect(self.processing_finished)
-        self.processing_thread.log_message.connect(self.append_log)
         
-        # Start processing
+        self.log_message("Starting video processing...")
         self.processing_thread.start()
-        
-        # Update status
-        self.status_label.setText("Processing...")
-        
-        # Enable force stop button
-        self.force_stop_btn.setEnabled(True)
-        
-        # Disable UI elements during processing
-        self.disable_ui_during_processing(True)
     
-    def stop_processing(self):
-        """Stop the video processing"""
-        if self.processing_thread and self.processing_thread.isRunning():
-            self.processing_thread.stop()
-            self.status_label.setText("Stopping processing...")
-            self.append_log("Stopping processing - please wait...")
-    
-    def update_progress(self, value):
-        """Update the progress bar"""
-        self.progress_bar.setValue(value)
-        self.progress_bar.setFormat(f"{value}%")
-    
-    def update_frame_preview(self, image, current_frame=0, total_frames=0):
-        """Update the preview with reduced frequency and scaling"""
-        # Only update preview every 10 frames or when progress is updated
-        if current_frame % 10 != 0 and current_frame != total_frames - 1:
-            return
-            
-        # Skip preview generation if widget isn't visible
-        if not self.isVisible() or self.isMinimized():
-            return
-            
-        # Create a smaller preview for better performance
-        preview_size = (320, 180)  # 16:9 ratio, smaller size
-        
-        try:
-            # Use fast resize method for preview only
-            scaled_pixmap = pixmap.scaled(
-                *preview_size,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation  # Use faster transformation
-            )
-            
-            self.preview_label.setPixmap(scaled_pixmap)
-            
-            # Update frame counter less frequently
-            if total_frames > 0:
-                self.frame_counter_label.setText(f"Frame: {current_frame}/{total_frames}")
-        except:
-            pass  # Ignore preview errors to maintain processing speed
-      
-    def show_about(self):
-        """Show information about deface"""
-        about_text = (
-            "deface: Image and video anonymization by face detection\n\n"
-            "deface is a command-line tool for automatic anonymization of faces in images or videos. "
-            "It works by detecting faces and applying an anonymization filter.\n\n"
-            "Features:\n"
-            "- Multiple anonymization methods (blur, solid boxes, mosaic)\n"
-            "- Adjustable detection threshold\n"
-            "- Support for downscaling to improve performance\n"
-            "- Optional box/ellipse masking\n\n"
-            "For more information, visit: https://github.com/ORB-HD/deface"
-        )
-        
-        QMessageBox.information(self, "About deface", about_text)
+    def processing_finished(self, message):
+        self.log_message(f"Processing finished: {message}")
+        self.process_btn.setEnabled(True)
+        self.input_btn.setEnabled(True)
+        self.output_btn.setEnabled(True)
 
-    def check_dependencies(self):
-        """Check if required dependencies are installed"""
-        try:
-            # Check deface
-            subprocess.run(["deface", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        except (subprocess.SubprocessError, FileNotFoundError):
-            QMessageBox.critical(
-                self,
-                "Deface Not Found",
-                "The deface library was not found. Please install it using:\n\npip install deface"
-            )
-            return False
-        return True
-
-    def closeEvent(self, event):
-        """Handle window close event - stop any running processes"""
-        if self.is_processing and self.processing_thread and self.processing_thread.isRunning():
-            self.append_log("Window closing - stopping all processing...")
-            self.processing_thread.stop()
-            self.processing_thread.wait(1000)  # Wait up to 1 second for graceful termination
-            
-            # Force termination if still running
-            if self.processing_thread.isRunning():
-                self.processing_thread.terminate()
-            
-            self.is_processing = False
-        
-        # Accept the close event
-        event.accept()
-
-    def set_deface_integration(self, deface_integration):
-        self.deface = deface_integration
-        # Update any related labels/state if needed
-        self.append_log("Using direct deface integration (no command line)")
-
-    def start_processing(self):
-        """Start processing with adaptive quality based on video size"""
-        # Get video file size and adapt settings
-        file_size_mb = os.path.getsize(self.input_file) / (1024 * 1024)
-        
-        if file_size_mb > 1000:  # For very large videos (>1GB)
-            self.append_log("Large file detected - enabling performance optimizations")
-            # Reduce resolution for detection
-            detection_scale = 0.33
-            # Increase batch size
-            batch_size = 8
-            # Decrease update frequency
-            update_interval = 30
-        elif file_size_mb > 100:  # Medium size (100MB-1GB)
-            detection_scale = 0.5
-            batch_size = 4
-            update_interval = 15
-        else:  # Small videos
-            detection_scale = 0.75
-            batch_size = 2
-            update_interval = 5
-            
-        # Pass these parameters to the processing thread
-        self.processing_thread = VideoProcessingThread(
-            self.input_file,
-            self.output_file,
-            {**self.options, 
-             "detection_scale": detection_scale,
-             "batch_size": batch_size,
-             "update_interval": update_interval}
-        )
-
-class MainApplication:
-    def __init__(self):
-        self.deface = DefaceIntegration()
-        
-        # Pass deface to components
-        self.image_processor = FaceAnonymizationBatchApp()
-        self.image_processor.deface = self.deface
-        
-        self.video_processor = FaceAnonymizationVideoApp()
-        self.video_processor.deface = self.deface
-        
-        self.frame_extractor = FrameExtractionApp()
-        self.frame_extractor.deface = self.deface
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
-    # Set application style
-    app.setStyle("Fusion")
+    # Set application icon (will be used as default for all windows)
+    app_icon = QIcon("assets/app_icon.png")  
+    app.setWindowIcon(app_icon)
     
-    window = FaceAnonymizationVideoApp()
-    window.show()
+    window = WelcomeWindow()
+    window.showMaximized()  # Use this instead of showFullScreen()
     sys.exit(app.exec())

@@ -1,6 +1,5 @@
 import sys
 import os
-import subprocess
 from pathlib import Path
 import time
 import datetime
@@ -16,8 +15,10 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QColor
 
-from deface_integration import DefaceIntegration
-
+# Import deface module directly instead of using subprocess
+from centerface import CenterFace
+import deface
+from version import __version__ as deface_version
 
 class BatchProcessingThread(QThread):
     """Thread for processing multiple images with deface without freezing the UI"""
@@ -34,6 +35,18 @@ class BatchProcessingThread(QThread):
         self.use_custom_output = use_custom_output
         self.options = options
         self.is_running = True
+        
+        # Create CenterFace detector once for the whole thread
+        scale = None
+        if self.options["scale"] and self.options["scale"] != "None":
+            scale_parts = self.options["scale"].split('x')
+            if len(scale_parts) == 2:
+                try:
+                    scale = (int(scale_parts[0]), int(scale_parts[1]))
+                except ValueError:
+                    scale = None
+        
+        self.centerface = CenterFace(in_shape=scale)
 
     def run(self):
         try:
@@ -83,7 +96,7 @@ class BatchProcessingThread(QThread):
             total_files = len(all_image_files)
             self.log_message.emit(f"Found {total_files} images to process")
             
-            # Process each image
+            # Process each image using direct deface calls
             for i, (image_path, input_folder) in enumerate(all_image_files):
                 if not self.is_running:
                     self.log_message.emit("Processing stopped by user")
@@ -97,70 +110,53 @@ class BatchProcessingThread(QThread):
                 output_folder = input_to_output_folders[input_folder]
                 output_path = Path(output_folder) / f"{image_path.stem}_anonymized{image_path.suffix}"
                 
-                # Build the deface command
-                cmd = ["deface", str(image_path), "-o", str(output_path)]
-                                
-                # Add options based on user selections
-                if self.options["threshold"] != 0.2:  # Default is 0.2
-                    cmd.extend(["--thresh", str(self.options["threshold"])])
-                
-                if self.options["mask_scale"] != 1.3:  # Default is 1.3
-                    cmd.extend(["--mask-scale", str(self.options["mask_scale"])])
-                
-                if self.options["anonymization_method"] != "blur":
-                    cmd.extend(["--replacewith", self.options["anonymization_method"]])
-                
-                if self.options["anonymization_method"] == "mosaic" and self.options["mosaic_size"] != 20:
-                    cmd.extend(["--mosaicsize", str(self.options["mosaic_size"])])
-                
-                if self.options["box_method"]:
-                    cmd.append("--boxes")
-                
-                if self.options["draw_scores"]:
-                    cmd.append("--draw-scores")
-                
-                # Scaling option for detection
-                if self.options["scale"]:
-                    cmd.extend(["--scale", self.options["scale"]])
-                
-                # Log the command being executed
-                cmd_str = " ".join(cmd)
-                self.log_message.emit(f"Executing command: {cmd_str}")
-                
-                # Execute the deface command
-                process = subprocess.Popen(
-                    cmd, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    universal_newlines=True,
-                    # creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
-                )
-                
-                stdout, stderr = process.communicate()
-                
-                # Log output
-                if stdout:
-                    self.log_message.emit(stdout.strip())
-                
-                # Check if successful
-                if process.returncode == 0:
+                try:
+                    # Read input image
+                    img = cv2.imread(str(image_path))
+                    
+                    if img is None:
+                        self.log_message.emit(f"Error: Could not read image file: {image_path}")
+                        continue
+                    
+                    # Get options
+                    threshold = self.options["threshold"]
+                    mask_scale = self.options["mask_scale"]
+                    replacewith = self.options["anonymization_method"]
+                    ellipse = not self.options["box_method"]
+                    draw_scores = self.options["draw_scores"]
+                    mosaicsize = self.options["mosaic_size"]
+                    blur_intensity = self.options["blur_intensity"]
+                    
+                    # Detect faces
+                    dets, _ = self.centerface(img, threshold=threshold)
+                    
+                    # Anonymize faces
+                    deface.anonymize_frame(
+                        dets, img, mask_scale=mask_scale,
+                        replacewith=replacewith, ellipse=ellipse, 
+                        draw_scores=draw_scores, replaceimg=None, 
+                        mosaicsize=mosaicsize,
+                        blur_intensity=blur_intensity
+                    )
+                    
+                    # Save the processed image
+                    cv2.imwrite(str(output_path), img)
+                    
                     self.log_message.emit(f"Successfully processed: {image_path.name}")
                     
                     # Load the output image for preview
                     if os.path.exists(output_path):
                         try:
-                            img = cv2.imread(str(output_path))
-                            if img is not None:
-                                # Convert to RGB
-                                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                                h, w, ch = img.shape
-                                qt_image = QImage(img.data, w, h, ch * w, QImage.Format.Format_RGB888)
-                                self.image_processed.emit(str(output_path), qt_image)
+                            # Convert to RGB for Qt
+                            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                            h, w, ch = img_rgb.shape
+                            qt_image = QImage(img_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+                            self.image_processed.emit(str(output_path), qt_image)
                         except Exception as e:
-                            self.log_message.emit(f"Error loading processed image: {str(e)}")
-                else:
-                    self.log_message.emit(f"Error processing {image_path.name}: {stderr}")
+                            self.log_message.emit(f"Error preparing preview: {str(e)}")
+                    
+                except Exception as e:
+                    self.log_message.emit(f"Error processing {image_path.name}: {str(e)}")
                 
                 # Update progress
                 progress = int((i + 1) / total_files * 100)
@@ -202,25 +198,8 @@ class FaceAnonymizationBatchApp(QMainWindow):
         self.processing_thread = None
         self.current_preview_file = None
         
-        # Check if deface is installed
-        try:
-            # Check if deface is installed and get version
-            result = subprocess.run(
-                ["deface", "--version"], 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE, 
-                text=True,
-                check=True
-            )
-            # Store the version for later display
-            self.deface_version = result.stdout.strip()
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            QMessageBox.critical(
-                self,
-                "Deface Not Found",
-                "The deface library was not found. Please install it using:\n\npython -m pip install deface"
-            )
-            sys.exit(1)
+        # Get the deface version directly
+        self.deface_version = deface_version
         
         self.init_ui()
     
@@ -320,22 +299,34 @@ class FaceAnonymizationBatchApp(QMainWindow):
         self.scale_combo.addItems(["None", "640x360", "1280x720", "1920x1080"])
         scale_layout.addWidget(self.scale_combo)
         
-        # Checkboxes for options
-        checks_layout = QVBoxLayout()
-        
-        self.box_check = QCheckBox("Use boxes instead of ellipse masks")
-        checks_layout.addWidget(self.box_check)
-        
-        self.draw_scores_check = QCheckBox("Draw detection scores")
-        checks_layout.addWidget(self.draw_scores_check)
-        
         # Add all layouts to options
         options_layout.addLayout(anon_layout)
         options_layout.addLayout(self.mosaic_layout)
         options_layout.addLayout(thresh_layout)
         options_layout.addLayout(mask_layout)
         options_layout.addLayout(scale_layout)
-        options_layout.addLayout(checks_layout)
+        
+        # Blur intensity
+        blur_intensity_layout = QHBoxLayout()
+        blur_intensity_layout.addWidget(QLabel("Blur Intensity:"))
+        self.blur_intensity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.blur_intensity_slider.setMinimum(1)  # Strongest blur
+        self.blur_intensity_slider.setMaximum(10) # Lightest blur
+        self.blur_intensity_slider.setValue(5)    # Change default to middle value (5)
+        self.blur_intensity_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.blur_intensity_slider.setTickInterval(1)  # Add this line to show all tick marks
+        self.blur_intensity_value_label = QLabel("2")
+        self.blur_intensity_slider.valueChanged.connect(self.update_blur_intensity_value)
+        blur_intensity_layout.addWidget(self.blur_intensity_slider)
+        blur_intensity_layout.addWidget(self.blur_intensity_value_label)
+        blur_note = QLabel("(1=strongest blur, 10=lightest blur)")
+        blur_note.setStyleSheet("color: gray; font-size: 9pt;")
+        blur_intensity_layout.addWidget(blur_note)
+
+        # Add the layout to options_layout
+        options_layout.addLayout(blur_intensity_layout)
+        self.blur_intensity_layout = blur_intensity_layout
+
         options_group.setLayout(options_layout)
         
         # Update UI to hide mosaic settings initially
@@ -384,9 +375,6 @@ class FaceAnonymizationBatchApp(QMainWindow):
         self.process_btn.clicked.connect(self.toggle_processing)
         self.process_btn.setEnabled(False)
         
-        self.about_btn = QPushButton("About deface")
-        self.about_btn.clicked.connect(self.show_about)
-        
         self.force_stop_btn = QPushButton("Force Stop")
         self.force_stop_btn.setEnabled(False)
         self.force_stop_btn.clicked.connect(self.stop_processing)
@@ -394,7 +382,6 @@ class FaceAnonymizationBatchApp(QMainWindow):
         
         buttons_layout.addWidget(self.process_btn)
         buttons_layout.addWidget(self.force_stop_btn)
-        buttons_layout.addWidget(self.about_btn)
         
         # Log area
         log_group = QGroupBox("Log")
@@ -430,6 +417,9 @@ class FaceAnonymizationBatchApp(QMainWindow):
         self.append_log(f"Batch Image Face Anonymization App started (powered by deface {self.deface_version})")
         self.append_log("Ready to process images")
 
+        # Initialize the blur intensity value label
+        self.update_blur_intensity_value()
+
     def toggle_output_mode(self):
         """Toggle between default and custom output folder modes"""
         self.use_custom_output = self.output_mode_btn.isChecked()
@@ -456,6 +446,14 @@ class FaceAnonymizationBatchApp(QMainWindow):
                 widget = item.widget()
                 if widget:
                     widget.setVisible(method == "mosaic")
+                
+        # Show blur intensity only when blur method is selected  
+        for i in range(self.blur_intensity_layout.count()):
+            item = self.blur_intensity_layout.itemAt(i)
+            if item:
+                widget = item.widget()
+                if widget:
+                    widget.setVisible(method == "blur")
     
     def update_threshold_value(self):
         """Update the threshold value label"""
@@ -466,6 +464,13 @@ class FaceAnonymizationBatchApp(QMainWindow):
         """Update the mask scale value label"""
         value = self.mask_scale_slider.value() / 10
         self.mask_scale_value_label.setText(f"{value:.1f}")
+    
+    def update_blur_intensity_value(self):
+        """Update the blur intensity value label"""
+        value = self.blur_intensity_slider.value()
+        self.blur_intensity_value_label.setText(f"{value}")
+        # Optional: make the value more visible
+        self.blur_intensity_value_label.setStyleSheet("font-weight: bold;")
     
     def append_log(self, message):
         """Add a message to the log with timestamp"""
@@ -625,9 +630,10 @@ class FaceAnonymizationBatchApp(QMainWindow):
             "mask_scale": float(self.mask_scale_value_label.text()),
             "anonymization_method": self.anon_method.currentText(),
             "mosaic_size": self.mosaic_size.value(),
-            "box_method": self.box_check.isChecked(),
-            "draw_scores": self.draw_scores_check.isChecked(),
-            "scale": self.scale_combo.currentText() if self.scale_combo.currentIndex() > 0 else ""
+            "box_method": False,  # Default to ellipse masks (no checkbox)
+            "draw_scores": False,  # Default to not drawing scores (no checkbox)
+            "scale": self.scale_combo.currentText() if self.scale_combo.currentIndex() > 0 else "",
+            "blur_intensity": self.blur_intensity_slider.value() if self.anon_method.currentText() == "blur" else 5
         }
         
         # Log the output location strategy
@@ -721,25 +727,7 @@ class FaceAnonymizationBatchApp(QMainWindow):
         self.threshold_slider.setEnabled(not disable)
         self.mask_scale_slider.setEnabled(not disable)
         self.scale_combo.setEnabled(not disable)
-        self.box_check.setEnabled(not disable)
-        self.draw_scores_check.setEnabled(not disable)
         self.file_list.setEnabled(not disable)
-    
-    def show_about(self):
-        """Show information about deface"""
-        about_text = (
-            "deface: Image and video anonymization by face detection\n\n"
-            "deface is a command-line tool for automatic anonymization of faces in images or videos. "
-            "It works by detecting faces and applying an anonymization filter.\n\n"
-            "Features:\n"
-            "- Multiple anonymization methods (blur, solid boxes, mosaic)\n"
-            "- Adjustable detection threshold\n"
-            "- Support for downscaling to improve performance\n"
-            "- Optional box/ellipse masking\n\n"
-            "For more information, visit: https://github.com/ORB-HD/deface"
-        )
-        
-        QMessageBox.information(self, "About deface", about_text)
     
     def closeEvent(self, event):
         """Handle window close event - stop any running processes"""

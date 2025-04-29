@@ -9,13 +9,17 @@ import cv2
 import numpy as np
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton, 
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton, QWidget,
+                             QVBoxLayout, QHBoxLayout, QFileDialog, QSlider,
                             QProgressBar, QComboBox, QSpinBox, QCheckBox, QGroupBox,
                             QRadioButton, QButtonGroup, QMessageBox, QPlainTextEdit,
-                            QListWidget, QListWidgetItem, QStackedWidget)
+                            QListWidget, QListWidgetItem, QStackedWidget, QSizePolicy)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
 from PyQt6.QtGui import QImage, QPixmap, QColor, QFont, QIcon
-from deface_integration import DefaceIntegration
+from centerface import CenterFace
+import deface
+import imageio
+import cv2
 
 class VideoProcessingThread(QThread):
     """Thread for processing videos with deface without freezing the UI"""
@@ -55,183 +59,292 @@ class VideoProcessingThread(QThread):
             
             self.log_message.emit(f"Processing video: {os.path.basename(self.input_file)}")
             
-            # Build the deface command
-            cmd = ["deface", str(self.input_file), "-o", str(self.output_file)]
+            # Configure options for deface module
+            threshold = self.options["threshold"]
+            mask_scale = self.options["mask_scale"]
+            replacewith = self.options["anonymization_method"]
+            ellipse = not self.options["box_method"]
+            draw_scores = self.options["draw_scores"]
+            mosaicsize = self.options["mosaic_size"] if "mosaic_size" in self.options else 20
+            blur_intensity = self.options["blur_intensity"] if "blur_intensity" in self.options else 5
             
-            # Add options based on user selections
-            if self.options["threshold"] != 0.2:  # Default is 0.2
-                cmd.extend(["--thresh", str(self.options["threshold"])])
+            # Prepare scale parameter
+            scale = None
+            if self.options["scale"] and self.options["scale"] != "None":
+                scale_parts = self.options["scale"].split('x')
+                if len(scale_parts) == 2:
+                    try:
+                        scale = (int(scale_parts[0]), int(scale_parts[1]))
+                    except ValueError:
+                        scale = None
             
-            if self.options["mask_scale"] != 1.3:  # Default is 1.3
-                cmd.extend(["--mask-scale", str(self.options["mask_scale"])])
+            # Create CenterFace instance
+            centerface = CenterFace(in_shape=scale)
             
-            if self.options["anonymization_method"] != "blur":
-                cmd.extend(["--replacewith", self.options["anonymization_method"]])
-            
-            if self.options["anonymization_method"] == "mosaic" and self.options["mosaic_size"] != 20:
-                cmd.extend(["--mosaicsize", str(self.options["mosaic_size"])])
-            
-            if self.options["box_method"]:
-                cmd.append("--boxes")
-            
-            if self.options["draw_scores"]:
-                cmd.append("--draw-scores")
-            
-            # Scaling option for detection
-            if self.options["scale"]:
-                cmd.extend(["--scale", self.options["scale"]])
-            
-            # Log the command being executed
-            cmd_str = " ".join(cmd)
-            self.log_message.emit(f"Executing command: {cmd_str}")
-            
-            # Open video to get total frames (for progress calculation)
+            # Get total frames for progress tracking
             try:
-                # Use ffprobe to get frame count (more reliable than OpenCV)
-                try:
-                    result = subprocess.run(
-                        ["ffprobe", "-v", "error", "-select_streams", "v:0", 
-                         "-show_entries", "stream=nb_frames", "-of", "default=noprint_wrappers=1:nokey=1", 
-                         self.input_file],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        timeout=10
-                    )
+                import cv2  # Make sure cv2 is imported here
+                cap = cv2.VideoCapture(self.input_file)
+                if not cap.isOpened():
+                    self.log_message.emit("Warning: Could not open input video file.")
+                    total_frames = 0
+                else:
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    if total_frames <= 0:
+                        self.log_message.emit("Warning: Could not determine total frames from metadata.")
+                        cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1)
+                        total_frames = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                        cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 0)  # Reset to beginning
                     
-                    if result.returncode == 0 and result.stdout.strip().isdigit():
-                        total_frames = int(result.stdout.strip())
-                        self.log_message.emit(f"Total frames (from ffprobe): {total_frames}")
+                    if total_frames > 0:
+                        self.log_message.emit(f"Total frames in video: {total_frames}")
                     else:
-                        # Fall back to OpenCV method...
-                        cap = cv2.VideoCapture(self.input_file)
-                        if not cap.isOpened():
-                            self.log_message.emit("Warning: Could not open input video file.")
-                            total_frames = 0
-                        else:
-                            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                            # Some video formats don't report frame count correctly
-                            if total_frames <= 0:
-                                self.log_message.emit("Warning: Could not determine total frames from metadata.")
-                                # Try to estimate by seeking to the end
-                                # This seeking operation can be problematic for large videos
-                                cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1)
-                                total_frames = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                                cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 0)  # Reset to beginning
-                            
-                            if total_frames > 0:
-                                self.log_message.emit(f"Total frames in video: {total_frames}")
-                            else:
-                                self.log_message.emit("Warning: Unable to determine total frames. Progress will be estimated.")
-                                total_frames = 0
-                            
-                        cap.release()
-                except:
-                    # Fall back to OpenCV method...
-                    cap = cv2.VideoCapture(self.input_file)
-                    if not cap.isOpened():
-                        self.log_message.emit("Warning: Could not open input video file.")
+                        self.log_message.emit("Warning: Unable to determine total frames. Progress will be estimated.")
                         total_frames = 0
-                    else:
-                        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                        # Some video formats don't report frame count correctly
-                        if total_frames <= 0:
-                            self.log_message.emit("Warning: Could not determine total frames from metadata.")
-                            # Try to estimate by seeking to the end
-                            # This seeking operation can be problematic for large videos
-                            cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1)
-                            total_frames = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                            cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 0)  # Reset to beginning
-                        
-                        if total_frames > 0:
-                            self.log_message.emit(f"Total frames in video: {total_frames}")
-                        else:
-                            self.log_message.emit("Warning: Unable to determine total frames. Progress will be estimated.")
-                            total_frames = 0
-                        
-                    cap.release()
+                cap.release()
             except Exception as e:
                 self.log_message.emit(f"Warning: Could not determine total frames. Progress may be inaccurate. Error: {str(e)}")
                 total_frames = 0
             
-            # Initialize before the while loop that reads stderr
-            frame_count = 0
-            last_heartbeat = time.time()
+            # Log all parameters for debugging
+            self.log_message.emit(f"Processing parameters:")
+            self.log_message.emit(f"  Anonymization method: {replacewith}")
+            self.log_message.emit(f"  Threshold: {threshold}")
+            self.log_message.emit(f"  Mask scale: {mask_scale}")
+            self.log_message.emit(f"  Box method: {self.options['box_method']}")
+            self.log_message.emit(f"  Draw scores: {draw_scores}")
+            if replacewith == "mosaic":
+                self.log_message.emit(f"  Mosaic size: {mosaicsize}")
+            if replacewith == "blur":
+                self.log_message.emit(f"  Blur intensity: {blur_intensity}")
 
-            # Execute deface with a pipe to capture realtime output
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                bufsize=1,
-                creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
-            )
-            
-            # Add a debug message
-            self.log_message.emit("Starting to read output from deface process...")
+            # Process the video using imageio and deface directly
+            try:
+                # Initialize video reader
+                reader = imageio.get_reader(self.input_file)
+                meta = reader.get_meta_data()
+                fps = meta.get('fps', 30)
+                
+                # Configure video writer with explicit orientation control
+                try:
+                    # Initialize video reader
+                    reader = imageio.get_reader(self.input_file)
+                    meta = reader.get_meta_data()
+                    fps = meta.get('fps', 30)
+                    
+                    # Get first frame to determine dimensions
+                    try:
+                        test_frame = reader.get_data(0)
+                        height, width = test_frame.shape[:2]
+                        self.log_message.emit(f"Video dimensions: {width}x{height}")
+                    except Exception as e:
+                        self.log_message.emit(f"Could not read first frame: {str(e)}")
+                        height, width = None, None
+                    
+                    # Close and reopen reader to start from beginning
+                    reader.close()
+                    reader = imageio.get_reader(self.input_file)
+                    
+                    # Configure ffmpeg options with explicit dimensions
+                    ffmpeg_config = {
+                        "codec": "libx264",
+                        "macro_block_size": 1,  # Set to 1 to avoid resizing
+                        "ffmpeg_log_level": "warning",
+                    }
+                    
+                    if height is not None and width is not None:
+                        ffmpeg_config["output_params"] = [
+                            "-pix_fmt", "yuv420p",
+                            "-vf", f"scale={width}:{height}"  # Ensure exact dimensions
+                        ]
+                except Exception as e:
+                    self.log_message.emit(f"Error configuring video dimensions: {str(e)}")
+                    ffmpeg_config = {"codec": "libx264"}
+                
+                # Configure ffmpeg options
+                ffmpeg_config = {"codec": "libx264"}
+                
+                # Initialize video writer
+                writer = imageio.get_writer(
+                    self.output_file, 
+                    format='FFMPEG', 
+                    mode='I', 
+                    fps=fps,
+                    **ffmpeg_config
+                )
+                
+                # Process each frame
+                frame_count = 0
+                last_progress_update = time.time()
+                last_heartbeat = time.time()
+                
+                self.log_message.emit(f"Starting video processing with direct deface module integration...")
+                
+                for frame in reader:
+                    if not self.is_running:
+                        self.log_message.emit("Processing stopped by user")
+                        break
+                    
+                    # Detect faces using centerface
+                    dets, _ = centerface(frame, threshold=threshold)
+                    
+                    # Anonymize faces
+                    if replacewith == "blur":
+                        # For blur method, handle intensity directly
+                        # Exponentially increased blur kernel size for much stronger effect
+                        blur_kernel_size = max(5, int(501 - (blur_intensity ** 4) * 0.05))
+                        # Make sure kernel size is odd
+                        if blur_kernel_size % 2 == 0:
+                            blur_kernel_size += 1
+                        
+                        self.log_message.emit(f"Using blur kernel size: {blur_kernel_size}")
+                        
+                        # Process each detected face
+                        for det in dets:
+                            x1, y1, x2, y2, _ = det
+                            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                            
+                            # Calculate mask scale (expand detection box)
+                            width, height = x2-x1, y2-y1
+                            center_x, center_y = (x1 + x2) // 2, (y1 + y2) // 2
+                            
+                            # Apply scaling factor
+                            new_width = int(width * mask_scale)
+                            new_height = int(height * mask_scale)
+                            
+                            # Recalculate box coordinates with mask_scale
+                            x1_scaled = max(0, center_x - new_width // 2)
+                            y1_scaled = max(0, center_y - new_height // 2)
+                            x2_scaled = min(frame.shape[1], center_x + new_width // 2)
+                            y2_scaled = min(frame.shape[0], center_y + new_height // 2)
+                            
+                            # Extract face region (with scaling)
+                            face_region = frame[y1_scaled:y2_scaled, x1_scaled:x2_scaled].copy()
+                            
+                            # Skip if face region is empty (can happen at image borders)
+                            if face_region.size == 0:
+                                continue
+                                
+                            # Apply blur with appropriate kernel size
+                            blurred_face = cv2.GaussianBlur(face_region, (blur_kernel_size, blur_kernel_size), 0)
+                            
+                            # Apply multiple passes based on intensity (more passes for lower intensity values)
+                            additional_passes = max(1, 10 - blur_intensity)
+                            for _ in range(additional_passes):
+                                blurred_face = cv2.GaussianBlur(blurred_face, (blur_kernel_size, blur_kernel_size), 0)
 
-            # Read process output to track progress
-            while self.is_running and process.poll() is None:
-                # Try to read a line from stderr (deface outputs progress there)
-                stderr_line = process.stderr.readline().strip()
-                
-                # Heartbeat to show the process is still alive
-                current_time = time.time()
-                if current_time - last_heartbeat > 10:  # Send heartbeat every 10 seconds
-                    last_heartbeat = current_time
-                    self.log_message.emit(f"Still processing... (current frame: {frame_count})")
-                    # Force a UI update with current frame count
-                    self.frame_processed.emit(QImage(), frame_count, total_frames)
-                
-                if stderr_line:
-                    # Log raw output for debugging
-                    if "Processing frame" in stderr_line:
-                        # Parse frame number from output
-                        try:
-                            match = re.search(r"Processing frame (\d+)", stderr_line)
-                            if match:
-                                frame_num = int(match.group(1))
-                                if frame_num > frame_count:
-                                    frame_count = frame_num
-                                    # Update UI with the parsed frame count
-                                    self.frame_processed.emit(QImage(), frame_count, total_frames)
+                            # For intensity 1-3, add pixelation on top of blurring for maximum anonymization
+                            if blur_intensity <= 3:
+                                # Add pixelation effect on top of blur
+                                height, width = blurred_face.shape[:2]
+                                pixel_size = 12 - blur_intensity * 2  # Larger pixels for stronger effect
+                                temp = cv2.resize(blurred_face, (width // pixel_size, height // pixel_size), 
+                                                  interpolation=cv2.INTER_LINEAR)
+                                blurred_face = cv2.resize(temp, (width, height), interpolation=cv2.INTER_NEAREST)
+                                
+                            self.log_message.emit(f"Applied {additional_passes+1} blur passes with kernel size {blur_kernel_size}")
+                            if blur_intensity <= 3:
+                                self.log_message.emit(f"Added pixelation effect for maximum privacy")
+                            
+                            # Replace region in the frame
+                            if ellipse:
+                                # Create a mask for elliptical blur
+                                mask_height, mask_width = y2_scaled-y1_scaled, x2_scaled-x1_scaled
+                                mask = np.zeros((mask_height, mask_width), dtype=np.uint8)
+                                
+                                # Draw ellipse on the mask
+                                try:
+                                    center = (mask_width // 2, mask_height // 2)
+                                    axes = (int(mask_width // 2 * 0.95), int(mask_height // 2 * 0.95))
+                                    cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
                                     
-                                    # Log every 100 frames for reassurance
-                                    if frame_count % 100 == 0:
-                                        self.log_message.emit(f"Processing frame {frame_count}...")
-                        except Exception as e:
-                            self.log_message.emit(f"Error parsing frame number: {str(e)}")
-
-            # Process is still running, wait for it to complete
-            stdout, stderr = process.communicate()
-            
-            # Check if successful
-            if process.returncode == 0:
-                self.log_message.emit("Video processing completed successfully")
+                                    # Expand mask to match face_region channels
+                                    mask_3d = np.repeat(mask[:, :, np.newaxis], 3, axis=2)
+                                    
+                                    # Apply elliptical blur
+                                    frame[y1_scaled:y2_scaled, x1_scaled:x2_scaled] = np.where(
+                                        mask_3d > 0, 
+                                        blurred_face, 
+                                        frame[y1_scaled:y2_scaled, x1_scaled:x2_scaled]
+                                    )
+                                except Exception as e:
+                                    # Fallback to rectangular blur if ellipse fails
+                                    self.log_message.emit(f"Ellipse error: {str(e)}, falling back to rectangle")
+                                    frame[y1_scaled:y2_scaled, x1_scaled:x2_scaled] = blurred_face
+                            else:
+                                # Apply rectangular blur
+                                frame[y1_scaled:y2_scaled, x1_scaled:x2_scaled] = blurred_face
+                    else:
+                        # For other methods, use the standard anonymize_frame
+                        deface.anonymize_frame(
+                            dets, frame, mask_scale=mask_scale,
+                            replacewith=replacewith, ellipse=ellipse, 
+                            draw_scores=draw_scores, replaceimg=None, 
+                            mosaicsize=mosaicsize
+                        )
+                    
+                    # Write the processed frame
+                    writer.append_data(frame)
+                    
+                    # Update progress
+                    frame_count += 1
+                    current_time = time.time()
+                    
+                    # Heartbeat message every 10 seconds
+                    if current_time - last_heartbeat > 10:
+                        last_heartbeat = current_time
+                        self.log_message.emit(f"Still processing... (current frame: {frame_count})")
+                    
+                    # Update progress bar roughly every second
+                    if current_time - last_progress_update > 1.0:
+                        last_progress_update = current_time
+                        
+                        # Update UI with progress
+                        if total_frames > 0:
+                            progress = min(int((frame_count / total_frames) * 100), 99)
+                            self.progress_updated.emit(progress)
+                        
+                        # Log frame info (less frequently)
+                        if frame_count % 100 == 0:
+                            if total_frames > 0:
+                                self.log_message.emit(f"Processing frame: {frame_count}/{total_frames} " +
+                                                    f"({(frame_count/total_frames*100):.1f}%)")
+                            else:
+                                self.log_message.emit(f"Processing frame: {frame_count}")
+                    
+                    # Send frame for preview (every 5th frame to avoid GUI slowdown)
+                    if frame_count % 5 == 0:
+                        h, w = frame.shape[:2]
+                        rgb_frame = frame  # imageio already gives us RGB format
+                        bytes_per_line = 3 * w
+                        qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                        self.frame_processed.emit(qt_image, frame_count, total_frames)
+                
+                # Close reader and writer
+                reader.close()
+                writer.close()
+                
+                # Successful completion
+                self.log_message.emit(f"Video processing completed successfully. Processed {frame_count} frames.")
                 self.progress_updated.emit(100)  # Ensure 100% at the end
                 self.processing_finished.emit("Video processing completed")
-            else:
-                error_msg = f"Error processing video: {stderr}"
+                
+            except Exception as e:
+                error_msg = f"Error during video processing: {str(e)}"
                 self.log_message.emit(error_msg)
                 
-                # Check for common errors and provide more helpful feedback
-                if "moov atom not found" in stderr:
+                # Check for common errors and provide helpful feedback
+                if "No such file" in str(e):
+                    self.log_message.emit("This error often occurs when the output directory doesn't exist or isn't writable.")
+                    self.log_message.emit("Make sure the output path is valid and you have write permissions.")
+                elif "moov atom not found" in str(e):
                     self.log_message.emit("This error often occurs with corrupted MP4 files or files with metadata issues.")
-                    self.log_message.emit("Possible solutions:")
-                    self.log_message.emit("1. Try re-encoding the video with ffmpeg: ffmpeg -i input.mp4 -c copy fixed.mp4")
-                    self.log_message.emit("2. Use a different video format like .avi or .mkv")
-                    self.log_message.emit("3. If the video plays in a media player, try capturing it with a screen recorder")
-                    self.processing_finished.emit("Processing failed - MP4 metadata issue detected")
-                elif "Failed to create detector" in stderr:
-                    self.log_message.emit("This error may occur if there are issues with the face detection model.")
-                    self.log_message.emit("Try reinstalling deface: pip uninstall deface && pip install deface")
-                    self.processing_finished.emit("Processing failed - Detection model issue")
-                else:
-                    self.processing_finished.emit("Processing failed")
+                    self.log_message.emit("Try using a different video format like .avi or .mkv")
+                
+                self.processing_finished.emit("Processing failed")
             
         except Exception as e:
-            error_msg = f"Error during video processing: {str(e)}"
+            error_msg = f"Error during video processing setup: {str(e)}"
             self.log_message.emit(error_msg)
             self.processing_finished.emit(error_msg)
     
@@ -326,23 +439,13 @@ class FaceAnonymizationVideoApp(QMainWindow):
         
         # Check if deface is installed
         try:
-            # Check if deface is installed and get version
-            result = subprocess.run(
-                ["deface", "--version"], 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE, 
-                text=True,
-                check=True
-            )
-            # Store the version for later display
-            self.deface_version = result.stdout.strip()
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            QMessageBox.critical(
-                self,
-                "Deface Not Found",
-                "The deface library was not found. Please install it using:\n\npython -m pip install deface"
-            )
-            sys.exit(1)
+            # Import version directly from the deface module
+            from version import __version__ as deface_version
+            self.deface_version = deface_version
+        except ImportError:
+            # Fallback if version module isn't available
+            self.deface_version = "unknown"
+            # Don't exit - we can still use the module even if we can't get its version
             
         # Also check for ffmpeg (optional but helpful)
         self.has_ffmpeg = False
@@ -387,11 +490,6 @@ class FaceAnonymizationVideoApp(QMainWindow):
         # Log application startup after welcome screen
         self.append_log(f"Video Face Anonymization App started (powered by deface {self.deface_version})")
         self.append_log("Ready to process videos")
-        
-    def return_to_welcome(self):
-        """Return to the welcome screen from the main application"""
-        self.stacked_widget.setCurrentIndex(0)
-        self.append_log("Returned to welcome screen")
         
     def init_main_ui(self):
         """Initialize the main UI components"""
@@ -507,22 +605,34 @@ class FaceAnonymizationVideoApp(QMainWindow):
         self.scale_combo.addItems(["None", "640x360", "1280x720", "1920x1080"])
         scale_layout.addWidget(self.scale_combo)
         
-        # Checkboxes for options
-        checks_layout = QVBoxLayout()
-        
-        self.box_check = QCheckBox("Use boxes instead of ellipse masks")
-        checks_layout.addWidget(self.box_check)
-        
-        self.draw_scores_check = QCheckBox("Draw detection scores")
-        checks_layout.addWidget(self.draw_scores_check)
-        
         # Add all layouts to options
         options_layout.addLayout(anon_layout)
         options_layout.addLayout(self.mosaic_layout)
         options_layout.addLayout(thresh_layout)
         options_layout.addLayout(mask_layout)
         options_layout.addLayout(scale_layout)
-        options_layout.addLayout(checks_layout)
+
+        # Add this code in the init_main_ui method after the checks_layout section
+
+        # Blur intensity slider (only visible when blur method is selected)
+        self.blur_intensity_layout = QHBoxLayout()
+        self.blur_intensity_layout.addWidget(QLabel("Blur Intensity:"))
+        self.blur_intensity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.blur_intensity_slider.setMinimum(1)  # Strongest blur
+        self.blur_intensity_slider.setMaximum(10) # Lightest blur
+        self.blur_intensity_slider.setValue(5)    # Default: medium blur
+        self.blur_intensity_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.blur_intensity_slider.setTickInterval(1)  # Show all tick marks
+        self.blur_intensity_value_label = QLabel("5")
+        self.blur_intensity_slider.valueChanged.connect(self.update_blur_intensity_value)
+        self.blur_intensity_layout.addWidget(self.blur_intensity_slider)
+        self.blur_intensity_layout.addWidget(self.blur_intensity_value_label)
+        blur_note = QLabel("(1=strongest blur, 10=lightest blur)")
+        blur_note.setStyleSheet("color: gray; font-size: 9pt;")
+        self.blur_intensity_layout.addWidget(blur_note)
+
+        # Add the layout to options_layout after checks_layout
+        options_layout.addLayout(self.blur_intensity_layout)
         options_group.setLayout(options_layout)
         
         # Update UI to hide mosaic settings initially
@@ -531,13 +641,21 @@ class FaceAnonymizationVideoApp(QMainWindow):
         # Preview
         preview_group = QGroupBox("Video Preview")
         preview_layout = QVBoxLayout()
-        
+
+        # Create a container widget to better control sizing
+        preview_container = QWidget()
+        preview_container_layout = QVBoxLayout(preview_container)
+        preview_container_layout.setContentsMargins(0, 0, 0, 0)
+        preview_container.setMinimumSize(640, 360)
+
         self.preview_label = QLabel()
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumSize(640, 360)
+        self.preview_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.preview_label.setStyleSheet("background-color: #f0f0f0;")
         self.preview_label.setText("Video preview will appear here during processing")
-        preview_layout.addWidget(self.preview_label)
+
+        preview_container_layout.addWidget(self.preview_label)
+        preview_layout.addWidget(preview_container)
         preview_group.setLayout(preview_layout)
         
         # Progress
@@ -557,22 +675,12 @@ class FaceAnonymizationVideoApp(QMainWindow):
         self.batch_process_btn.setEnabled(False)
         buttons_layout.addWidget(self.batch_process_btn)
 
-        # Add a button to return to welcome screen
-        self.welcome_btn = QPushButton("Return to Welcome")
-        self.welcome_btn.clicked.connect(self.return_to_welcome)
-        self.welcome_btn.setEnabled(True)
-        buttons_layout.addWidget(self.welcome_btn)
-
-        self.about_btn = QPushButton("About deface")
-        self.about_btn.clicked.connect(self.show_about)
-        
         self.force_stop_btn = QPushButton("Force Stop")
         self.force_stop_btn.setEnabled(False)
         self.force_stop_btn.clicked.connect(self.stop_processing)
         self.force_stop_btn.setStyleSheet("background-color: #ff6666;")
         
         buttons_layout.addWidget(self.force_stop_btn)
-        buttons_layout.addWidget(self.about_btn)
         
         # Log area
         log_group = QGroupBox("Log")
@@ -763,9 +871,10 @@ class FaceAnonymizationVideoApp(QMainWindow):
             "mask_scale": float(self.mask_scale_value_label.text()),
             "anonymization_method": self.anon_method.currentText(),
             "mosaic_size": self.mosaic_size.value(),
-            "box_method": self.box_check.isChecked(),
-            "draw_scores": self.draw_scores_check.isChecked(),
-            "scale": self.scale_combo.currentText() if self.scale_combo.currentIndex() > 0 else ""
+            "box_method": False,  # Always use ellipse masks
+            "draw_scores": False,  # Never draw scores
+            "scale": self.scale_combo.currentText() if self.scale_combo.currentIndex() > 0 else "",
+            "blur_intensity": self.blur_intensity_slider.value() if self.anon_method.currentText() == "blur" else 5
         }
         
         # Reset progress bar
@@ -889,9 +998,7 @@ class FaceAnonymizationVideoApp(QMainWindow):
         self.threshold_slider.setEnabled(not disable)
         self.mask_scale_slider.setEnabled(not disable)
         self.scale_combo.setEnabled(not disable)
-        self.box_check.setEnabled(not disable)
-        self.draw_scores_check.setEnabled(not disable)
-        self.welcome_btn.setEnabled(not disable)
+        self.blur_intensity_slider.setEnabled(not disable)
 
         # Disable batch control buttons as well
         self.remove_selected_btn.setEnabled(not disable)
@@ -910,6 +1017,14 @@ class FaceAnonymizationVideoApp(QMainWindow):
                 if widget:
                     widget.setVisible(method == "mosaic")
     
+        # Show blur intensity only when blur method is selected
+        for i in range(self.blur_intensity_layout.count()):
+            item = self.blur_intensity_layout.itemAt(i)
+            if item:
+                widget = item.widget()
+                if widget:
+                    widget.setVisible(method == "blur")
+    
     def update_threshold_value(self):
         """Update the threshold value label"""
         value = self.threshold_slider.value() / 100
@@ -919,6 +1034,14 @@ class FaceAnonymizationVideoApp(QMainWindow):
         """Update the mask scale value label"""
         value = self.mask_scale_slider.value() / 10
         self.mask_scale_value_label.setText(f"{value:.1f}")
+
+    # Add this method after update_mask_scale_value
+
+    def update_blur_intensity_value(self):
+        """Update the blur intensity value label"""
+        value = self.blur_intensity_slider.value()
+        self.blur_intensity_value_label.setText(f"{value}")
+        self.blur_intensity_value_label.setStyleSheet("font-weight: bold;")
     
     def append_log(self, message):
         """Add a message to the log with timestamp"""
@@ -930,45 +1053,6 @@ class FaceAnonymizationVideoApp(QMainWindow):
         self.log_text.verticalScrollBar().setValue(
             self.log_text.verticalScrollBar().maximum()
         )
-    
-    # def browse_input_file(self):
-    #     """Open file dialog to select input video file"""
-    #     file_path, _ = QFileDialog.getOpenFileName(
-    #         self, "Select Input Video", "", "Video Files (*.mp4 *.avi *.mov *.mkv *.webm);;All Files (*.*)"
-    #     )
-    #     if file_path:
-    #         self.input_file = file_path
-    #         self.input_path_label.setText(os.path.basename(file_path))
-            
-    #         # Set default output file with "_anonymized" suffix
-    #         input_name = os.path.basename(file_path)
-    #         input_base = os.path.splitext(input_name)[0]
-    #         input_ext = os.path.splitext(input_name)[1]
-    #         default_output_file = os.path.join(
-    #             os.path.dirname(file_path),
-    #             f"{input_base}_anonymized{input_ext}"
-    #         )
-    #         self.output_file = default_output_file
-    #         self.output_path_label.setText(os.path.basename(default_output_file))
-            
-    #         self.append_log(f"Input video selected: {file_path}")
-    #         self.append_log(f"Default output file set to: {self.output_file}")
-            
-    #         self.check_files_selected()
-            
-    #         # Try to show a thumbnail preview of the video
-    #         self.show_video_thumbnail(file_path)
-    
-    # def browse_output_file(self):
-    #     """Open file dialog to select output video file location"""
-    #     file_path, _ = QFileDialog.getSaveFileName(
-    #         self, "Save Output Video", "", "Video Files (*.mp4 *.avi *.mov *.mkv *.webm);;All Files (*.*)"
-    #     )
-    #     if file_path:
-    #         self.output_file = file_path
-    #         self.output_path_label.setText(os.path.basename(file_path))
-    #         self.append_log(f"Output file set to: {file_path}")
-    #         self.check_files_selected()
     
     def show_video_thumbnail(self, video_path):
         """Show a thumbnail of the first frame of the video"""
@@ -1122,20 +1206,15 @@ class FaceAnonymizationVideoApp(QMainWindow):
         else:
             self.stop_processing()
     
-    # def start_processing(self):
-    #     """Start the deface video processing"""
-    #     self.is_processing = True
-    #     self.process_btn.setText("Stop Processing")
-        
-        # Gather options
         options = {
             "threshold": float(self.threshold_value_label.text()),
             "mask_scale": float(self.mask_scale_value_label.text()),
             "anonymization_method": self.anon_method.currentText(),
             "mosaic_size": self.mosaic_size.value(),
-            "box_method": self.box_check.isChecked(),
-            "draw_scores": self.draw_scores_check.isChecked(),
-            "scale": self.scale_combo.currentText() if self.scale_combo.currentIndex() > 0 else ""
+            "box_method": False,  # Always use ellipse masks
+            "draw_scores": False,  # Never draw scores
+            "scale": self.scale_combo.currentText() if self.scale_combo.currentIndex() > 0 else "",
+            "blur_intensity": self.blur_intensity_slider.value() if self.anon_method.currentText() == "blur" else 5
         }
         
         # Create and start the processing thread
@@ -1187,62 +1266,32 @@ class FaceAnonymizationVideoApp(QMainWindow):
         if not image.isNull():
             pixmap = QPixmap.fromImage(image)
             
-            # Scale the pixmap to fit the preview label while maintaining aspect ratio
+            # Get the current size of the preview area with some margin
+            preview_size = self.preview_label.size()
+            available_width = preview_size.width() - 20  # 10px margin on each side
+            available_height = preview_size.height() - 20
+            
+            # Calculate the scaling needed to fit the image
+            img_width = pixmap.width()
+            img_height = pixmap.height()
+            
+            # Calculate scale factors to fit width and height
+            w_scale = available_width / img_width
+            h_scale = available_height / img_height
+            
+            # Use the smaller scale to ensure the entire image fits
+            scale_factor = min(w_scale, h_scale)
+            
+            # Scale the pixmap while maintaining aspect ratio
             scaled_pixmap = pixmap.scaled(
-                self.preview_label.size(),
+                int(img_width * scale_factor),
+                int(img_height * scale_factor),
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation
             )
             
             self.preview_label.setPixmap(scaled_pixmap)
-    
-    # def processing_finished(self, message):
-    #     """Handle the end of processing"""
-    #     self.is_processing = False
-    #     self.process_btn.setText("Process Video")
-    #     self.status_label.setText(message)
-        
-    #     # Disable force stop button
-    #     self.force_stop_btn.setEnabled(False)
-        
-    #     # Re-enable UI elements
-    #     self.disable_ui_during_processing(False)
-        
-    #     # Show a message box if completed successfully
-    #     if "completed" in message.lower():
-    #         QMessageBox.information(
-    #             self,
-    #             "Processing Complete",
-    #             f"{message}\n\nOutput file: {self.output_file}"
-    #         )
-    
-    # def disable_ui_during_processing(self, disable):
-    #     """Enable/disable UI elements during processing"""
-    #     # self.browse_input_btn.setEnabled(not disable)
-    #     self.browse_output_btn.setEnabled(not disable)
-    #     self.anon_method.setEnabled(not disable)
-    #     self.mosaic_size.setEnabled(not disable)
-    #     self.threshold_slider.setEnabled(not disable)
-    #     self.mask_scale_slider.setEnabled(not disable)
-    #     self.scale_combo.setEnabled(not disable)
-    #     self.box_check.setEnabled(not disable)
-    #     self.draw_scores_check.setEnabled(not disable)
-    
-    def show_about(self):
-        """Show information about deface"""
-        about_text = (
-            "deface: Image and video anonymization by face detection\n\n"
-            "deface is a command-line tool for automatic anonymization of faces in images or videos. "
-            "It works by detecting faces and applying an anonymization filter.\n\n"
-            "Features:\n"
-            "- Multiple anonymization methods (blur, solid boxes, mosaic)\n"
-            "- Adjustable detection threshold\n"
-            "- Support for downscaling to improve performance\n"
-            "- Optional box/ellipse masking\n\n"
-            "For more information, visit: https://github.com/ORB-HD/deface"
-        )
-        
-        QMessageBox.information(self, "About deface", about_text)
+            self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
     def closeEvent(self, event):
         """Handle window close event - stop any running processes"""

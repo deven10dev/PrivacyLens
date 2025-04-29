@@ -14,7 +14,6 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QLabel, QPushButton,
                             QListWidget, QDoubleSpinBox, QLineEdit)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QColor
-from deface_integration import DefaceIntegration
 
 
 def detect_video_orientation(video_path):

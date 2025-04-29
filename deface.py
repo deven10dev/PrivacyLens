@@ -14,8 +14,8 @@ import imageio.v2 as iio
 import imageio.plugins.ffmpeg
 import cv2
 
-from deface import __version__
-from deface.centerface import CenterFace
+from version import __version__
+from centerface import CenterFace
 
 
 def scale_bb(x1, y1, x2, y2, mask_scale=1.0):
@@ -35,16 +35,43 @@ def draw_det(
         draw_scores: bool = False,
         ovcolor: Tuple[int] = (0, 0, 0),
         replaceimg = None,
-        mosaicsize: int = 20
+        mosaicsize: int = 20,
+        blur_intensity: int = 2  # Add this parameter with default of 2
 ):
     if replacewith == 'solid':
         cv2.rectangle(frame, (x1, y1), (x2, y2), ovcolor, -1)
     elif replacewith == 'blur':
-        bf = 2  # blur factor (number of pixels in each dimension that the face will be reduced to)
-        blurred_box =  cv2.blur(
-            frame[y1:y2, x1:x2],
-            (abs(x2 - x1) // bf, abs(y2 - y1) // bf)
-        )
+        # Convert from 1-10 scale to blur factor (1=strongest, 10=weakest)
+        if blur_intensity <= 5:
+            # Strong blur: map 1-5 to factors 0.5-2.0
+            bf = 0.5 + (blur_intensity - 1) * 0.375
+        else:
+            # Weak blur: map 6-10 to factors 2.5-6.0
+            bf = 2.5 + (blur_intensity - 6) * 0.875
+        
+        # Get the region to blur
+        region = frame[y1:y2, x1:x2].copy()
+        
+        # Apply multiple blur passes for extreme levels (1-2)
+        blur_passes = 1
+        if blur_intensity == 1:
+            blur_passes = 3
+        elif blur_intensity == 2:
+            blur_passes = 2
+            
+        for _ in range(blur_passes):
+            # Fix: Calculate kernel size properly avoiding division by zero
+            kernel_w = max(1, int(abs(x2 - x1) / bf))
+            kernel_h = max(1, int(abs(y2 - y1) / bf))
+            
+            # Ensure kernel dimensions are odd (better for blur algorithms)
+            kernel_w = kernel_w if kernel_w % 2 == 1 else kernel_w + 1
+            kernel_h = kernel_h if kernel_h % 2 == 1 else kernel_h + 1
+            
+            # Use Gaussian blur for smoother results
+            region = cv2.GaussianBlur(region, (kernel_w, kernel_h), 0)
+        
+        blurred_box = region
         if ellipse:
             roibox = frame[y1:y2, x1:x2]
             # Get y and x coordinate lists of the "bounding ellipse"
@@ -78,7 +105,8 @@ def draw_det(
 
 def anonymize_frame(
         dets, frame, mask_scale,
-        replacewith, ellipse, draw_scores, replaceimg, mosaicsize
+        replacewith, ellipse, draw_scores, replaceimg, mosaicsize,
+        blur_intensity=2  # Add this parameter
 ):
     for i, det in enumerate(dets):
         boxes, score = det[:4], det[4]
@@ -93,7 +121,8 @@ def anonymize_frame(
             ellipse=ellipse,
             draw_scores=draw_scores,
             replaceimg=replaceimg,
-            mosaicsize=mosaicsize
+            mosaicsize=mosaicsize,
+            blur_intensity=blur_intensity  # Pass the parameter
         )
 
 
@@ -118,7 +147,8 @@ def video_detect(
         replaceimg = None,
         keep_audio: bool = False,
         mosaicsize: int = 20,
-        disable_progress_output = False
+        disable_progress_output = False,
+        blur_intensity: int = 2  # Add this parameter
 ):
     try:
         if 'fps' in ffmpeg_config:
@@ -165,7 +195,8 @@ def video_detect(
         anonymize_frame(
             dets, frame, mask_scale=mask_scale,
             replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-            replaceimg=replaceimg, mosaicsize=mosaicsize
+            replaceimg=replaceimg, mosaicsize=mosaicsize,
+            blur_intensity=blur_intensity  # Pass the parameter
         )
 
         if opath is not None:
@@ -196,6 +227,7 @@ def image_detect(
         keep_metadata: bool,
         replaceimg = None,
         mosaicsize: int = 20,
+        blur_intensity: int = 2  # Add this parameter
 ):
     frame = iio.imread(ipath)
 
@@ -210,7 +242,8 @@ def image_detect(
     anonymize_frame(
         dets, frame, mask_scale=mask_scale,
         replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-        replaceimg=replaceimg, mosaicsize=mosaicsize
+        replaceimg=replaceimg, mosaicsize=mosaicsize,
+        blur_intensity=blur_intensity  # Pass the parameter
     )
 
     if enable_preview:
@@ -248,7 +281,8 @@ def get_anonymized_image(frame,
                          mask_scale: float,
                          ellipse: bool,
                          draw_scores: bool,
-                         replaceimg = None
+                         replaceimg = None,
+                         blur_intensity: int = 2  # Add this parameter
                          ):
     """
     Method for getting an anonymized image without CLI
@@ -261,7 +295,7 @@ def get_anonymized_image(frame,
     anonymize_frame(
         dets, frame, mask_scale=mask_scale,
         replacewith=replacewith, ellipse=ellipse, draw_scores=draw_scores,
-        replaceimg=replaceimg
+        replaceimg=replaceimg, blur_intensity=blur_intensity  # Pass the parameter
     )
 
     return frame
@@ -325,6 +359,10 @@ def parse_cli_args():
         '--keep-metadata', '-m', default=False, action='store_true',
         help='Keep metadata of the original image. Default : False.')
     parser.add_argument('--help', '-h', action='help', help='Show this help message and exit.')
+    parser.add_argument(
+        '--blur-intensity', default=5, type=int, metavar='I', choices=range(1, 11),
+        help='Blur intensity on scale of 1-10 (1=strongest blur, 10=weakest blur). Default: 5.'
+    )
 
     args = parser.parse_args()
 
@@ -371,6 +409,7 @@ def main():
     keep_metadata = args.keep_metadata
     replaceimg = None
     disable_progress_output = args.disable_progress_output
+    blur_intensity = args.blur_intensity
 
     if in_shape is not None:
         w, h = in_shape.split('x')
@@ -417,7 +456,8 @@ def main():
                 ffmpeg_config=ffmpeg_config,
                 replaceimg=replaceimg,
                 mosaicsize=mosaicsize,
-                disable_progress_output=disable_progress_output
+                disable_progress_output=disable_progress_output,
+                blur_intensity=blur_intensity  # Pass the parameter
             )
         elif filetype == 'image':
             image_detect(
@@ -432,7 +472,8 @@ def main():
                 enable_preview=enable_preview,
                 keep_metadata=keep_metadata,
                 replaceimg=replaceimg,
-                mosaicsize=mosaicsize
+                mosaicsize=mosaicsize,
+                blur_intensity=blur_intensity  # Pass the parameter
             )
         elif filetype is None:
             print(f'Can\'t determine file type of file {ipath}. Skipping...')
